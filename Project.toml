@@ -1,0 +1,37 @@
+name = "StatArb"
+uuid = "29e224ac-e7f4-4780-96e2-30e66da721b2"
+version = "0.1.0"
+authors = ["Rainer Rodrigues"]
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
+
+[weakdeps]
+Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
+
+[extensions]
+StatArbArrowExt = "Arrow"
+
+[compat]
+Arrow = "2"
+Dates = "1"
+LinearAlgebra = "1"
+Printf = "1"
+Random = "1"
+StaticArrays = "1.9"
+Statistics = "1"
+StructArrays = "0.6, 0.7"
+julia = "1.10"
+
+[extras]
+Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Arrow", "Test"]
