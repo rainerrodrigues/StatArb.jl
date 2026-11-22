@@ -5,7 +5,10 @@
 _need!(errs, cond::Bool, msg::AbstractString) = (cond || push!(errs, msg); errs)
 
 function _check!(errs, k::KalmanConfig)
+    _need!(errs, k.model in (:rw, :ou), "kalman.model must be :rw or :ou, got :$(k.model)")
     _need!(errs, 0 < k.delta < 1, "kalman.delta must be in (0, 1), got $(k.delta)")
+    _need!(errs, k.obs_noise_frac === nothing || 0 <= k.obs_noise_frac < 1,
+           "kalman.obs_noise_frac must be nothing (estimate) or in [0, 1), got $(k.obs_noise_frac)")
     _need!(errs, k.q_scale > 0, "kalman.q_scale must be positive, got $(k.q_scale)")
     _need!(errs, k.r_scale > 0, "kalman.r_scale must be positive, got $(k.r_scale)")
 end

@@ -36,8 +36,10 @@ At bar `t` it:
 
 - **Latency of at least one bar.** [`ExecutionSimulator`](@ref) refuses `latency < 1`, so an
   order can never fill on the bar that triggered it.
-- **Prior-state Z-scores.** The Kalman innovation is `y_t − F_t θ_{t−1}`, so the Z-score
-  traded at `t` hasn't seen bar `t` through the hedge ratio.
+- **Signals use only data up to `t`.** The random-walk model trades the innovation
+  `y_t − F_t θ_{t−1}`, which uses the prior state. The OU model trades the filtered spread
+  `ŝ_{t|t}`, which uses bar `t`, known at `t`. Either way, the order fills at `t + latency`
+  or later.
 - **Checked data access.** [`history`](@ref) and [`assert_past`](@ref) throw a
   [`LookaheadError`](@ref) for any bar after `clock.t`.
 - **Perturbation test.** The test suite scrambles every price after bar 800 and checks that

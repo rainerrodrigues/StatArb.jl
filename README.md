@@ -29,7 +29,7 @@ each layer, and the full API.
 | Workflow | What it checks |
 |---|---|
 | `ci.yml` → `test` | the full test suite (Aqua included) on Julia 1.10, 1.11 and latest on Linux, plus latest on macOS and Windows; coverage goes to Codecov |
-| `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery, false selections on pure noise, p-value calibration and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
+| `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery, false selections on pure noise, p-value calibration, Kalman innovation whiteness and spread tracking, and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
 | `ci.yml` → `benchmark` | hot-loop latency, allocation counts and backtest throughput, posted to the job summary |
 | `ci.yml` → `jet` | JET static analysis of the whole package (pinned to Julia 1.12) |
 | `docs.yml` | builds the Documenter site, running every example, and deploys it to `gh-pages` |
@@ -43,7 +43,7 @@ each layer, and the full API.
 | `src/linalg.jl` | allocation-free Cholesky / triangular solves / OLS workspace |
 | `src/adf.jl` | ADF (fixed & AIC lag), Engle-Granger two-step, MacKinnon (2010) critical values, OU half-life |
 | `src/johansen.jl` | rolling Johansen VECM: trace & max-eigenvalue statistics, rank, cointegrating vector |
-| `src/kalman.jl` | `StaticArrays` Kalman filter for `θ_t = [α_t, β_t]`, innovation Z-scores, uncertainty throttle |
+| `src/kalman.jl` | `StaticArrays` Kalman filters: random-walk `[α, β]` and OU-augmented `[α, β, s]` with moment-based noise estimation; uncertainty throttle |
 | `src/execution.jl` | order lifecycle, market/limit fills, impact, participation/depth caps, legging, financing |
 | `src/screening.jl` | distance pre-screen, threaded pair/basket scans, health-gate state machine |
 | `src/selection.jl` | exact null distributions, Monte Carlo p-values, Benjamini-Hochberg FDR control |
@@ -64,9 +64,9 @@ each layer, and the full API.
 4. update the filters and health checks with bar `t`;
 5. decide orders, which become eligible from `t + latency`. `latency ≥ 1` is enforced.
 
-The Kalman Z-score uses the *prior* state, so it contains no information from bar `t` itself. The test
-suite checks this with a perturbation test: it scrambles every price after bar 800 and asserts the equity
-curve up to bar 800 doesn't change at all.
+Signals at bar `t` use data up to and including `t`, and their orders fill no earlier than
+`t + latency`. The test suite checks this with a perturbation test: it scrambles every price after bar
+800 and asserts the equity curve up to bar 800 doesn't change at all.
 
 **Ring buffers.** `MirroredRing` writes each sample at positions `p` and `p+W` of a
 `k × 2W` matrix. That makes the latest `W` samples always one contiguous, chronologically ordered
@@ -84,11 +84,26 @@ relation and no drift in prices, which is the natural model for a spread. The un
 variant (`det = :unrestricted`) is available, but on drift-free random walks it over-rejected badly
 (12–31% empirical size against a nominal 5%). The restricted version measured 4–7%.
 
-**Kalman filter.** `θ`, `P` and `Q` are `SVector`/`SMatrix` fields of a mutable struct. The observation
-is scalar, so the "inversion" is a scalar division, and an update takes about 30 ns with 0 allocations. Q
-uses a unit-free version of Chan's δ: `Q = q·δ/(1−δ)·σ²·diag(1, 1/x̄²)`. The textbook `δ/(1−δ)·I`
-depends on price units, and on log prices it let the intercept absorb the spread. Size is throttled by
-`min(1, P_ref / P_ββ)`.
+**Kalman filter.** Two models, both on `SVector`/`SMatrix` state with scalar observations, so
+there's no matrix inversion and no allocation.
+- **`:ou` (default):** the state is `[α, β, s]`, and the spread `s` is an AR(1)/OU state:
+  `s_t = φ s_{t−1} + η_t`.
+  - `φ`, `σ²_η` and the quote noise `R` are estimated from the residuals' first three
+    autocovariances (AR(1) plus noise), so bid-ask bounce isn't mistaken for spread dynamics.
+  - Every health check re-fits them on the rolling window.
+  - The signal is the filtered spread `ŝ_{t|t}/σ_s`, and the innovations are kept as a whiteness
+    check.
+  - Update time is about 71 ns.
+- **`:rw`:** the classic state `[α, β]` follows a random walk, and the signal is the innovation
+  Z-score `e/√S`. Update time is about 29 ns.
+
+Both use a unit-free version of Chan's δ for the α/β noise: `Q ∝ δ/(1−δ)·σ²·diag(1, 1/x̄²)`. The
+textbook `δ/(1−δ)·I` depends on price units, and on log prices it let the intercept absorb the
+spread. Size is throttled by `min(1, P_ref / P_ββ)`.
+
+On noisy synthetic quotes, the OU model trades 30–58% less, at the same or slightly lower
+Sharpe. The random-walk model partly profits from trading the quote noise itself, which this
+simulator makes easier to capture than real markets do.
 
 **Execution.**
 - **Market orders** pay the half spread plus square-root impact `η σ √(q/V)`.
@@ -127,28 +142,30 @@ raw Sharpe of 10.9 drops to 2.9).
 
 | Operation | Time | Allocations |
 |---|---|---|
-| Kalman update | ~29 ns | 0 |
+| Kalman update, OU model (3 states) | ~71 ns | 0 |
+| Kalman update, random-walk model (2 states) | ~29 ns | 0 |
 | Ring push + window view | ~3 ns | 0 |
 | Engle-Granger, W=250 | ~2.2 µs | 0 |
 | Johansen k=2, W=250 | ~10 µs | 0 |
 | Johansen k=3, W=250 | ~14 µs | 0 |
-| Full walk-forward, 30 assets × 2000 bars | ~38 ms | — |
+| Full walk-forward, 30 assets × 2000 bars | ~40 ms | — |
 
 ## What the demo shows (`examples/walkforward_demo.jl`)
 
 - **Parameter recovery** (300 simulations, β = 1.2, hl = 8): the EG, Johansen and Kalman β estimates
   average 1.1996, 1.1968 and 1.1996. The median half-life comes out at 7.1, a mild downward bias.
   Power is 99.7% for EG and 94% for Johansen.
-- **Execution style:** market orders give a Sharpe of 2.11 after costs. Passive limits give −1.39:
-  adverse selection and 88 legged fills cost about 42 bps against roughly 4 bps.
-- **Misspecification:** overestimating reversion speed 4× costs 0.87 Sharpe; underestimating it 4×
-  costs 0.09. Short health windows (W = 60/120) don't have the power to keep pairs out of quarantine,
-  so Sharpe drops to 0.16 and 1.32.
+- **Execution style:** market orders give a Sharpe of 2.29 after costs. Passive limits give −1.37:
+  adverse selection and 102 legged fills cost about 48 bps against roughly 4 bps.
+- **Misspecification:** overestimating reversion speed 4× costs 0.75 Sharpe; underestimating it 4×
+  costs nothing (−0.01). Short health windows (W = 60/120) don't have the power to keep pairs out of
+  quarantine, so Sharpe drops to 0.43 and 1.83.
 - **Pair selection:** with false-discovery control, a universe of pure random walks yields 0.02
   spurious pairs per formation, against 2.6 with plain per-test selection (see the CI validation job).
-- **Telemetry:** the Kalman innovation ACF(1) is about 0.69 because the planted spreads are OU
-  processes, which the random-walk-coefficient model treats as white noise. This is exactly the kind
-  of misspecification the dashboard is there to surface.
+- **Kalman model:** with the default OU-augmented filter, the innovation ACF(1) is 0.04, so the
+  innovations are white and the model fits. With `KalmanConfig(model = :rw)` it is about 0.7: the
+  random-walk model treats the OU spread as white noise. That's exactly the misspecification the
+  dashboard is designed to surface.
 
 ## Limitations / not included
 

@@ -57,7 +57,9 @@ export OLSWorkspace, ols!, ols_line, ADFResult, adf!, adf_auto!, mackinnon_crit,
        johansen_trace_cv, johansen_maxeig_cv
 # kalman
 export KalmanConfig, KalmanHedge, kalman_step, kalman_update!, calibrate_kalman, kalman_filter,
-       hedge_ratio, intercept, size_multiplier, autocor_lag, ljung_box
+       hedge_ratio, intercept, size_multiplier, autocor_lag, ljung_box,
+       OUKalmanHedge, ou_kalman_step, calibrate_ou_kalman, calibrate_filter, innovation_z,
+       filtered_spread, model_half_life, ar1_fit, ou_noise_fit, recalibrate!
 # execution
 export ExecConfig, ExecutionSimulator, Book, Order, FillRecord, OrderKind, MARKET, LIMIT,
        submit_pair!, process_orders!, accrue_financing!, apply_corporate_actions!, update_vol!, pending_qty, cancel_pair!,

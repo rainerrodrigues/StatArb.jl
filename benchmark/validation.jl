@@ -68,6 +68,24 @@ function pvalue_calibration(seed, n)
     mean(ps .< 0.05)
 end
 
+# Kalman model specification on OU pairs with quote noise: innovation whiteness, spread
+# tracking and the OU filter's implied half-life
+function kalman_spec(seed, nsim)
+    rng = Xoshiro(seed)
+    acf_ou = Float64[]; acf_rw = Float64[]; trk = Float64[]; hl = Float64[]
+    for _ in 1:nsim
+        sim = simulate_ou_pair(rng, 1500; beta = 1.2, half_life = 8.0, sigma_s = 0.006)
+        y = sim.y .+ 0.003 .* randn(rng, 1500)
+        ou = kalman_filter(y, sim.x; cfg = KalmanConfig(model = :ou), calibrate = 1:250)
+        rw = kalman_filter(y, sim.x; cfg = KalmanConfig(model = :rw), calibrate = 1:250)
+        r = 300:1500
+        push!(acf_ou, autocor_lag(ou.innov_z[r], 1)); push!(acf_rw, autocor_lag(rw.innov_z[r], 1))
+        push!(trk, cor(ou.spread[r], sim.s[r]))
+        push!(hl, model_half_life(calibrate_ou_kalman(view(y, 1:500), view(sim.x, 1:500), KalmanConfig())))
+    end
+    mean(acf_ou), mean(acf_rw), mean(trk), median(hl)
+end
+
 t0 = time()
 eg, j2, j3 = size_study(11, 4000, 250)
 check("Engle-Granger size (5% test, T=250)", fmt(eg), "0.035 – 0.065", 0.035 <= eg <= 0.065)
@@ -89,6 +107,12 @@ check("pure noise, FDR 5% selection: spurious pairs / formation", fmt(fdr_n), "�
 check("pure noise, FDR 5% selection: formations selecting anything", fmt(fdr_any), "≤ 0.10", fdr_any <= 0.10)
 pc = pvalue_calibration(14, 1000)
 check("selection p-values on null pairs: P(p < 0.05)", fmt(pc), "≤ 0.06 (valid)", pc <= 0.06)
+
+ka, kr, kt, kh = kalman_spec(15, 200)
+check("Kalman RW model: innovation ACF(1) on OU pairs + quote noise", fmt(kr), "(reference)", true)
+check("Kalman OU model: innovation ACF(1) on OU pairs + quote noise", fmt(ka), "abs < 0.10", abs(ka) < 0.10)
+check("Kalman OU model: corr(filtered spread, true spread)", fmt(kt), "≥ 0.90", kt >= 0.90)
+check("Kalman OU model: implied half-life median (true 8)", fmt(kh), "6.0 – 10.0", 6.0 <= kh <= 10.0)
 
 rr = vecm_rank_recovery(13, 300)
 check("VECM rank recovery (true r=2)", fmt(rr), "≥ 0.90", rr >= 0.90)

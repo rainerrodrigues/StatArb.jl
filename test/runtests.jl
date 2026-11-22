@@ -187,6 +187,66 @@ end
     @test u(kf, 1.0, 2.0) == 0
 end
 
+@testset "OU-augmented Kalman" begin
+    rng = Xoshiro(71)
+    # moment fit of AR(1) + measurement noise
+    φ0, σe, σn = 0.9, 0.01, 0.006
+    s = zeros(20_000)
+    for t in 2:length(s)
+        s[t] = φ0 * s[t-1] + σe * randn(rng)
+    end
+    obs = s .+ σn .* randn(rng, length(s))
+    φ, ση2, R = ou_noise_fit(obs)
+    @test φ ≈ φ0 atol = 0.02
+    @test ση2 ≈ σe^2 rtol = 0.15
+    @test R ≈ σn^2 rtol = 0.15
+    @test ar1_fit(s)[1] ≈ φ0 atol = 0.01
+    φw, _, Rw = ou_noise_fit(s)                                 # no noise: R at its floor
+    @test φw ≈ φ0 atol = 0.02
+    @test Rw < 0.01 * σe^2 / (1 - φ0^2)
+
+    # one step against a dense reference
+    θ = SVector(0.1, 1.2, 0.01); P = SMatrix{3,3}(Matrix(0.1I, 3, 3)); Q = SMatrix{3,3}(Matrix(Diagonal([1e-6, 1e-6, 1e-4])))
+    θn, Pn, e, S = ou_kalman_step(θ, P, 0.8, Q, 1e-5, 5.0, 4.0)
+    A = Diagonal([1.0, 1.0, 0.8]); H = [1.0 4.0 1.0]
+    Pp = A * Matrix(P) * A' + Matrix(Q); θp = A * Vector(θ)
+    Sd = (H * Pp * H')[1] + 1e-5; K = Pp * H' / Sd
+    @test S ≈ Sd
+    @test θn ≈ θp + vec(K) * (5.0 - (H*θp)[1])
+    @test Pn ≈ (I - K * H) * Pp rtol = 1e-8
+
+    # on an OU pair the OU filter's innovations are white, the random-walk filter's are not
+    sim = simulate_ou_pair(rng, 3000; beta = 1.3, half_life = 8.0, sigma_s = 0.006)
+    ou = kalman_filter(sim.y, sim.x; cfg = KalmanConfig(model = :ou), calibrate = 1:250)
+    rw = kalman_filter(sim.y, sim.x; cfg = KalmanConfig(model = :rw), calibrate = 1:250)
+    r = 300:3000
+    @test abs(autocor_lag(ou.innov_z[r], 1)) < 0.15
+    @test autocor_lag(rw.innov_z[r], 1) > 0.6
+    @test cor(ou.z[r], sim.s[r]) > 0.95
+    @test cor(ou.spread[r], sim.s[r]) > 0.95
+    @test mean(abs.(ou.beta[r] .- 1.3)) < 0.03
+    @test all(isnan, rw.spread)
+
+    kf = calibrate_filter(view(sim.y, 1:500), view(sim.x, 1:500), KalmanConfig())
+    @test kf isa OUKalmanHedge
+    @test 4 < model_half_life(kf) < 12
+    @test model_half_life(calibrate_filter(sim.y, sim.x, KalmanConfig(model = :rw))) == Inf
+    @test_throws ArgumentError calibrate_filter(sim.y, sim.x, KalmanConfig(model = :arma))
+    @test size_multiplier(kf) ≈ 1.0
+    # recalibration on a faster-reverting window lowers φ, keeps the state
+    θbefore = kf.θ
+    fast = zeros(400)
+    for t in 2:400
+        fast[t] = 0.5 * fast[t-1] + 0.01 * randn(rng)
+    end
+    recalibrate!(kf, fast, KalmanConfig(), 4.0)
+    @test kf.φ ≈ 0.5 atol = 0.15
+    @test kf.θ == θbefore
+    v(kf, a, b) = @allocated kalman_update!(kf, a, b)
+    v(kf, 4.0, 3.0)
+    @test v(kf, 4.0, 3.0) == 0
+end
+
 @testset "execution simulator" begin
     T = 10
     mid = fill(100.0, 2, T)
@@ -297,6 +357,12 @@ end
     @test occursin("MODEL HEALTH", s) && occursin("FACTOR ATTRIBUTION", s)
     # fills never happen before decision + latency
     @test all(res.fills.t .>= res.fills.submit_t .+ cfg.exec.latency)
+    # the OU filter (default) leaves near-white innovations; the random-walk model does not
+    rrw = run_backtest(panel, with(cfg; kalman = KalmanConfig(model = :rw)))
+    @test health_telemetry(res).innov_acf1 < 0.2
+    @test health_telemetry(rrw).innov_acf1 > 0.4
+    @test all(isfinite, res.health.kf_half_life)
+    @test all(==(Inf), rrw.health.kf_half_life)
     # a pair is tracked by its asset set: never two live states on the same two assets
     for f in res.formations
         @test length(unique(minmax(p...) for p in f.selected)) == length(f.selected)
@@ -362,6 +428,8 @@ end
     @test occursin("pair_cap (2.0) cannot exceed", err)
     @test_throws ArgumentError validate_config(BacktestConfig(hl_bounds = (1.0, 200.0)))
     @test_throws ArgumentError validate_config(BacktestConfig(coint_level = 0.03))
+    @test_throws ArgumentError validate_config(BacktestConfig(kalman = KalmanConfig(model = :arma)))
+    @test_throws ArgumentError validate_config(BacktestConfig(kalman = KalmanConfig(obs_noise_frac = 1.5)))
     @test_throws ArgumentError validate_config(BacktestConfig(risk = RiskConfig(maintenance_margin = 0.5, max_gross = 2.5, pair_cap = 0.1)))
     small = PricePanel(fill(10.0, 2, 100))
     @test_throws ArgumentError run_backtest(small)

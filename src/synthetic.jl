@@ -54,13 +54,15 @@ end
 Panel of `2·n_pairs` cointegrated assets (pair `i` uses assets `2i-1` (y) and `2i` (x)) plus
 `n_noise` independent random walks. Every asset shares a weak common market factor.
 Pairs are assigned their own sector; noise assets are spread across all sectors.
+`obs_noise` adds i.i.d. Gaussian noise of that standard deviation to every log price, which
+mimics bid-ask bounce and stale quotes (the spread dynamics are unchanged).
 `truth` lists `(y, x, beta, half_life)` for each planted pair.
 """
 function synthetic_universe(rng::AbstractRNG; n_pairs::Int = 8, n_noise::Int = 8, T::Int = 1500,
                             half_lives = range(2.0, 12.0; length = n_pairs),
                             betas = range(0.7, 1.5; length = n_pairs),
                             sigma_x = 0.012, sigma_s = 0.006, market_vol = 0.006,
-                            spread_bps = 4.0, volume = 2e6, depth_frac = 0.02)
+                            spread_bps = 4.0, volume = 2e6, depth_frac = 0.02, obs_noise = 0.0)
     n = 2n_pairs + n_noise
     L = zeros(n, T)
     mkt = cumsum(market_vol .* randn(rng, T))
@@ -79,6 +81,7 @@ function synthetic_universe(rng::AbstractRNG; n_pairs::Int = 8, n_noise::Int = 8
         L[a, :] = log(20 + 80rand(rng)) .+ cumsum(sigma_x .* randn(rng, T)) .+ mkt
         sector[a] = 1 + (j - 1) % max(n_pairs, 1)
     end
+    obs_noise > 0 && (L .+= obs_noise .* randn(rng, n, T))
     mid = exp.(L)
     vol = volume .* exp.(0.3 .* randn(rng, n, T))
     panel = PricePanel(mid; spread_bps = spread_bps, volume = vol, depth = vol .* depth_frac,

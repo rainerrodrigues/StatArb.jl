@@ -60,7 +60,7 @@ mutable struct PairState
     id::Int
     y::Int
     x::Int
-    kf::KalmanHedge
+    kf::Union{KalmanHedge,OUKalmanHedge}
     ring::MirroredRing        # 2 × W log prices
     zring::MirroredRing       # standardized innovations
     rring::MirroredRing       # spread returns (per $1 gross)
@@ -92,6 +92,7 @@ struct HealthRecord
     eg_adf::Float64
     eg_beta::Float64
     kf_beta::Float64
+    kf_half_life::Float64     # implied by the OU filter's φ (Inf for the random-walk model)
     innov_acf1::Float64
     healthy::Bool
     state::HealthState
@@ -202,19 +203,16 @@ function _formation!(pairs, byid, next_id::Ref{Int}, panel::PricePanel, cfg::Bac
     for (yi, xi) in selected
         minmax(yi, xi) in existing && continue          # retained pair keeps its live filter
         yv = view(logp, yi, rng); xv = view(logp, xi, rng)
-        kf = calibrate_kalman(yv, xv, cfg.kalman; warmup = false)
+        kf = calibrate_filter(yv, xv, cfg.kalman; warmup = false)
         zr = MirroredRing(1, cfg.innov_window)
-        for s in 1:F
-            push!(zr, kalman_update!(kf, yv[s], xv[s]))
-        end
-        kf.P_ref = kf.P[2, 2]
+        _warmup!(kf, zr, yv, xv)
         ring = MirroredRing(2, W)
         for τ in t-W+1:t
             push!(ring, (logp[yi, τ], logp[xi, τ]))
         end
         L = cfg.risk.cov_window
         rr = MirroredRing(1, L)
-        β = kf.θ[2]
+        β = hedge_ratio(kf)
         for τ in t-L+1:t
             push!(rr, ((logp[yi, τ] - logp[yi, τ-1]) - β * (logp[xi, τ] - logp[xi, τ-1])) / (1 + abs(β)))
         end
@@ -229,27 +227,43 @@ function _formation!(pairs, byid, next_id::Ref{Int}, panel::PricePanel, cfg::Bac
     nothing
 end
 
+# Run a freshly calibrated filter through the formation window (function barrier: `kf`
+# arrives as one of two concrete types), recording innovations for the telemetry ring.
+function _warmup!(kf, zr::MirroredRing, yv::AbstractVector, xv::AbstractVector)
+    @inbounds for s in eachindex(yv)
+        kalman_update!(kf, yv[s], xv[s])
+        push!(zr, innovation_z(kf))
+    end
+    kf.P_ref = kf.P[2, 2]
+    kf
+end
+
 # ─── per-bar pair update & health ────────────────────────────────────────────
 
 function _update_pair!(ps::PairState, panel::PricePanel, cfg::BacktestConfig, t::Int,
                        egws::EGWorkspace, jws::JohansenWorkspace, gate::HealthGateConfig, health)
     y = panel.logmid[ps.y, t]; x = panel.logmid[ps.x, t]
     yprev = latest(ps.ring, 1); xprev = latest(ps.ring, 2)
-    βprev = ps.kf.θ[2]
+    βprev = hedge_ratio(ps.kf)
     push!(ps.ring, (y, x))
-    z = kalman_update!(ps.kf, y, x)
-    push!(ps.zring, z)
+    kalman_update!(ps.kf, y, x)
+    push!(ps.zring, innovation_z(ps.kf))
     push!(ps.rring, ((y - yprev) - βprev * (x - xprev)) / (1 + abs(βprev)))
     if (t - ps.created_t) % cfg.health_every == 0
         eg = engle_granger!(egws, window(ps.ring, 1), window(ps.ring, 2); lags = cfg.adf_lags)
         js = johansen!(jws, window(ps.ring); level = cfg.coint_level)
         ok = healthy(gate, js, eg)
+        if cfg.kalman.recalibrate                 # re-fit the OU dynamics on the window
+            xw = window(ps.ring, 2)
+            recalibrate!(ps.kf, view(egws.resid, 1:length(xw)), cfg.kalman, sum(xw) / length(xw))
+        end
         ps.state, ps.good = gate_transition(gate, ps.state, ps.good, ok)
         ps.hl = eg.half_life
         ps.rank = js.rank
         acf1 = autocor_lag(filled_window(ps.zring, 1), 1)
         push!(health, HealthRecord(t, ps.id, ps.y, ps.x, js.rank, js.trace_r0, js.trace_r1, js.maxeig_r0,
-                                   eg.half_life, js.half_life, eg.adf, eg.beta, ps.kf.θ[2], acf1, ok, ps.state))
+                                   eg.half_life, js.half_life, eg.adf, eg.beta, hedge_ratio(ps.kf),
+                                   model_half_life(ps.kf), acf1, ok, ps.state))
     end
     nothing
 end
@@ -424,7 +438,7 @@ function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
                 my = panel.mid[ps.y, t]; mx = panel.mid[ps.x, t]
                 if ps.signal != 0
                     j += 1
-                    tgt_y[i], tgt_x[i] = leg_shares(w[j] * C * scale, ps.kf.θ[2], my, mx)
+                    tgt_y[i], tgt_x[i] = leg_shares(w[j] * C * scale, hedge_ratio(ps.kf), my, mx)
                 else
                     tgt_y[i], tgt_x[i] = 0.0, 0.0
                 end

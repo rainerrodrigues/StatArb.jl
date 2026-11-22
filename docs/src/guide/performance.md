@@ -6,7 +6,8 @@
 
 | Operation | Time | Allocations |
 |---|---|---|
-| Kalman update | ~29 ns | 0 |
+| Kalman update, OU model (3 states) | ~71 ns | 0 |
+| Kalman update, random-walk model (2 states) | ~29 ns | 0 |
 | Ring push + window view | ~3 ns | 0 |
 | Engle-Granger, W = 250 | ~2.2 µs | 0 |
 | Johansen, k = 2, W = 250 | ~10 µs | 0 |

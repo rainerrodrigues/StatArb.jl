@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Kalman filter
+
+- **OU-augmented Kalman filter (now the default, `KalmanConfig(model = :ou)`)**: the state
+  is `[α, β, s]`, with the spread as an AR(1)/OU state. `φ`, `σ²_η` and the measurement
+  noise `R` are estimated by autocovariance moments (`ou_noise_fit`), so quote noise
+  isn't mistaken for reversion. They're re-fitted on the rolling window at every health
+  check (`recalibrate = true`). The trading signal is the filtered spread `ŝ/σ_s`. About
+  71 ns per update, zero allocations. Innovation ACF(1) on noisy OU pairs drops from 0.86
+  to 0.02, and turnover falls 30–58% at similar Sharpe. `model = :rw` restores the
+  previous filter.
+- New: `OUKalmanHedge`, `ou_kalman_step`, `calibrate_ou_kalman`, `calibrate_filter`,
+  `innovation_z`, `filtered_spread`, `model_half_life`, `ar1_fit`, `ou_noise_fit`,
+  `recalibrate!`. `kalman_filter` returns `innov_z` and `spread` too.
+- The telemetry's innovation autocorrelation now uses the standardised innovation for
+  both models, and `res.health` records the OU filter's implied half-life
+  (`kf_half_life`).
+- `synthetic_universe(...; obs_noise)` adds i.i.d. quote noise to log prices.
+- The validation job checks innovation whiteness, spread tracking and half-life recovery.
+
 ### Robustness
 
 - **False-discovery control in pair selection** (`selection_fdr = 0.05` by default):
