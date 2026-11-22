@@ -72,8 +72,40 @@ two tests passes. See [`HealthGateConfig`](@ref).
     so healthy pairs keep getting quarantined. The default `health_window = 250`, and the
     sensitivity sweep shows what shorter windows cost.
 
+## Selecting pairs with false-discovery control
+
+Formation tests up to `screen_top` candidates at once. If each one is tested at 5%, about
+5% of the candidates that *aren't* cointegrated get through anyway. On a universe of pure
+random walks, that selects 2.6 spurious pairs per formation, and 95% of formations pick at
+least one.
+
+By default (`selection_fdr = 0.05`), selection controls the false discovery rate instead:
+
+1. Each candidate gets an exact finite-sample p-value from a simulated null distribution
+   of the *same* statistic formation computes: the more negative of the two Engle-Granger
+   orientations ([`eg_null_distribution`](@ref)), and the k = 2 Johansen trace with a
+   restricted constant ([`johansen_null_distribution`](@ref)). Each distribution is
+   simulated once per window length with a fixed seed (about 0.1 s) and cached.
+2. A pair's p-value is `max(p_EG, p_Johansen)`, so it only counts as significant when
+   *both* tests reject ([`pair_pvalues`](@ref)). Requiring both is conservative: on
+   unscreened null pairs, P(p < 0.05) is about 1.8%.
+3. [`benjamini_hochberg`](@ref) keeps the expected share of false discoveries among the
+   selected pairs at or below `q`.
+
+On the same noise universe, this selects 0.04 pairs per formation. Set
+`selection_fdr = 0` to go back to per-test selection at `coint_level`.
+
+!!! note "Screening bias"
+    The distance screen keeps the pairs whose paths look most alike, so the candidates'
+    statistics are more extreme than an unselected null. The p-values ignore this, so the
+    *nominal* guarantee doesn't strictly hold. The CI validation job measures what actually
+    happens on pure noise and fails the build if the false-selection rate rises above
+    0.15 pairs per formation.
+
 ## Pre-screening
 
 Testing every pair takes ``N(N-1)/2`` tests. [`distance_screen`](@ref) first z-normalises
 log prices over the formation window and keeps the `screen_top` pairs with the smallest
-sum of squared differences, optionally only within a sector.
+sum of squared differences, optionally only within a sector. Assets are only eligible if
+at least `min_tradable_frac` of the formation window's bars are real, tradable bars and
+the asset is tradable on the formation bar.

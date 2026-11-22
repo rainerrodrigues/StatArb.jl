@@ -7,7 +7,8 @@ makedocs(
     authors = "Rainer Rodrigues",
     # DOCS_DRAFT=true skips running the @example blocks (quick text-only builds)
     draft = get(ENV, "DOCS_DRAFT", "false") == "true",
-    format = Documenter.HTML(prettyurls = get(ENV, "CI", nothing) == "true"),
+    format = Documenter.HTML(prettyurls = get(ENV, "CI", nothing) == "true",
+                             size_threshold = 400 * 1024, size_threshold_warn = 300 * 1024),
     checkdocs = :exports,
     pages = [
         "Home" => "index.md",

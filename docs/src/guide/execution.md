@@ -30,8 +30,44 @@ When one leg fills and its sibling hasn't, the sibling becomes a market order an
 the spread `latency` bars later. Its fill is flagged as `legged`. A limit order that hasn't
 filled within `limit_wait` bars crosses as well.
 
-In the demo, passive execution pays about 46 bps of effective spread against about 2 bps
+In the demo, passive execution pays about 42 bps of effective spread against about 2 bps
 for market orders, and its Sharpe ratio turns negative.
+
+## Halts and missing data
+
+`panel.tradable` is `false` on bars that were missing in the source data, had zero volume,
+or were marked halted. On those bars:
+
+- no order fills; resting and in-flight orders simply wait;
+- pairs don't update their filters or ring buffers, because a stale quote carries no new
+  information;
+- no new positions open, although exits keep their signal and fill once trading resumes.
+
+## Corporate actions
+
+A [`CorporateAction`](@ref) records a split ratio and/or a cash dividend on its ex-date.
+Panel prices are raw, so they jump on the ex-date. Before that bar's fills,
+[`apply_corporate_actions!`](@ref):
+1. credits the dividend to long positions and debits it from short positions;
+2. multiplies share positions by the split ratio;
+3. rescales resting orders: quantity × split, and limit and reference prices ÷ split.
+
+Signals read `logmid`, which is adjusted forward in time only. That keeps it continuous
+through the event without ever depending on actions that haven't happened yet. A test
+injects a 2-for-1 split into the raw data and checks that the equity curve doesn't change
+(beyond share rounding).
+
+## Margin and forced liquidation
+
+After each bar's fills, the backtester compares equity with `risk.maintenance_margin ×
+gross exposure`. If equity falls below that, or to zero or less, it records a margin call,
+cancels every resting order and closes every position at market. New entries are then
+blocked for `risk.liquidation_cooldown` bars, or permanently if equity is gone. The
+dashboard lists every margin call.
+
+Allocations are capped at `risk.max_gross` when they're decided. Rebalance hysteresis
+(`min_trade_frac`) skips small adjustments, unless skipping them would leave the book above
+the cap. In that case, every open pair is brought to its jointly capped target.
 
 ## Financing
 

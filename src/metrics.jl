@@ -112,6 +112,7 @@ function cost_breakdown(res::BacktestResult)
     bps(x) = 1e4 * x / tn
     (traded_notional = b.traded_notional, spread = b.spread_paid, impact = b.impact_paid,
      commission = b.commission_paid, borrow = b.borrow_paid, interest_net = b.interest_net,
+     dividends_net = b.dividends_net,
      spread_bps = bps(b.spread_paid), impact_bps = bps(b.impact_paid), commission_bps = bps(b.commission_paid),
      n_fills = b.n_fills, n_legged = b.n_legged, n_passive = b.n_passive)
 end
@@ -152,7 +153,10 @@ function report(io::IO, res::BacktestResult; factors = nothing, factor_names = n
             c.traded_notional, c.n_fills, c.n_passive, c.n_legged)
     @printf(io, "   Spread %10.0f (%5.2f bps)  Impact %10.0f (%5.2f bps)  Comm %8.0f (%4.2f bps)\n",
             c.spread, c.spread_bps, c.impact, c.impact_bps, c.commission, c.commission_bps)
-    @printf(io, "   Borrow fees %10.0f   Net interest %10.0f\n", c.borrow, c.interest_net)
+    @printf(io, "   Borrow fees %10.0f   Net interest %10.0f   Net dividends %10.0f\n",
+            c.borrow, c.interest_net, c.dividends_net)
+    isempty(res.margin_calls) ||
+        println(io, "   ⚠ Margin calls (forced liquidation) at bars: ", join(res.margin_calls, ", "))
     println(io, " MODEL HEALTH")
     @printf(io, "   Health checks %6d   gate pass %5.1f %%   Johansen r≥1 %5.1f %%   quarantined %5.1f %%\n",
             h.n_checks, 100h.coint_survival, 100h.rank_survival, 100h.quarantine_rate)

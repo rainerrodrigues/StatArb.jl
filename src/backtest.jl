@@ -24,7 +24,10 @@ Base.@kwdef struct BacktestConfig
     health_every::Int = 5                # bars between health checks
     johansen_lags::Int = 1               # p − 1 lagged differences in the VECM
     adf_lags::Int = 1
-    coint_level::Float64 = 0.05
+    coint_level::Float64 = 0.05          # per-test level for health checks (and selection if FDR is off)
+    selection_fdr::Float64 = 0.05        # Benjamini-Hochberg FDR across formation candidates; 0 = off
+    null_sims::Int = 10_000              # Monte Carlo draws behind the selection p-values
+    min_tradable_frac::Float64 = 0.95    # assets need this share of tradable bars in the formation window
     max_pairs::Int = 10
     screen_top::Int = 100                # candidates kept by the distance screen
     same_sector_only::Bool = true
@@ -104,10 +107,18 @@ struct BarRecord
     n_open::Int
 end
 
+"""
+    FormationRecord
+
+One formation step: bar `t`, number of screened `n_candidates`, number that passed
+selection (`n_cointegrated`: significant after FDR control and within the half-life
+bounds), the smallest selection p-value, and the `selected` pairs as `(y, x)`.
+"""
 struct FormationRecord
     t::Int
     n_candidates::Int
     n_cointegrated::Int
+    min_pvalue::Float64
     selected::Vector{NTuple{2,Int}}
 end
 
@@ -129,6 +140,7 @@ struct BacktestResult
     fills::StructVector{FillRecord}
     formations::Vector{FormationRecord}
     book::Book
+    margin_calls::Vector{Int}
     bars_per_year::Float64
     symbols::Vector{Symbol}
 end
@@ -143,16 +155,27 @@ function _formation!(pairs, byid, next_id::Ref{Int}, panel::PricePanel, cfg::Bac
                      formations, sim)
     F, W = cfg.formation, cfg.health_window
     logp = panel.logmid
+    # assets with enough real (tradable) bars in the window and tradable right now
+    eligible = [panel.tradable[a, t] && count(view(panel.tradable, a, t-F+1:t)) >= cfg.min_tradable_frac * F
+                for a in 1:nassets(panel)]
     cands = distance_screen(logp, t, F; top = cfg.screen_top, sector = panel.sector,
-                            same_sector = cfg.same_sector_only)
+                            same_sector = cfg.same_sector_only, eligible = eligible)
     tests = test_pairs(logp, cands, t, F; adf_lags = cfg.adf_lags, kdiff = cfg.johansen_lags,
                        level = cfg.coint_level, threaded = cfg.threaded_formation)
     lo, hi = cfg.hl_bounds
-    good = filter(tests) do pt
-        iscointegrated(pt.eg, cfg.coint_level) && pt.joh.ok && pt.joh.rank >= 1 &&
-            lo <= pt.eg.half_life <= hi
+    if cfg.selection_fdr > 0
+        pv = pair_pvalues(tests, F; lags = cfg.adf_lags, kdiff = cfg.johansen_lags, nsim = cfg.null_sims)
+        significant = benjamini_hochberg(pv, cfg.selection_fdr)
+    else
+        pv = fill(NaN, length(tests))
+        significant = [iscointegrated(pt.eg, cfg.coint_level) && pt.joh.ok && pt.joh.rank >= 1 for pt in tests]
     end
-    sort!(good; by = pt -> pt.eg.adf)
+    keep = [significant[i] && lo <= tests[i].eg.half_life <= hi for i in eachindex(tests)]
+    good = tests[keep]
+    gp = pv[keep]
+    order = cfg.selection_fdr > 0 ? sortperm(collect(zip(gp, [pt.eg.adf for pt in good]))) :
+                                    sortperm([pt.eg.adf for pt in good])
+    good = good[order]
     used = Set{Int}()
     selected = NTuple{2,Int}[]
     for pt in good
@@ -163,7 +186,8 @@ function _formation!(pairs, byid, next_id::Ref{Int}, panel::PricePanel, cfg::Bac
         end
         push!(selected, (pt.y, pt.x))
     end
-    push!(formations, FormationRecord(t, length(cands), length(good), selected))
+    push!(formations, FormationRecord(t, length(cands), length(good),
+                                      isempty(pv) ? NaN : minimum(pv), selected))
 
     # Pairs are identified by their asset set, not orientation: a pair re-selected as
     # (x, y) keeps its existing live state instead of opening a second position.
@@ -230,7 +254,7 @@ function _update_pair!(ps::PairState, panel::PricePanel, cfg::BacktestConfig, t:
     nothing
 end
 
-function _update_signal!(ps::PairState, cfg::BacktestConfig, t::Int)
+function _update_signal!(ps::PairState, cfg::BacktestConfig, t::Int, can_open::Bool)
     ps.last_signal = ps.signal
     z = ps.kf.z
     if !(ps.state == ACTIVE && ps.in_universe)
@@ -243,6 +267,7 @@ function _update_signal!(ps::PairState, cfg::BacktestConfig, t::Int)
         return
     end
     if ps.signal == 0
+        can_open || return
         if z > cfg.z_entry
             ps.signal = -1; ps.entry_t = t
         elseif z < -cfg.z_entry
@@ -262,17 +287,21 @@ end
 
 # ─── main loop ───────────────────────────────────────────────────────────────
 
+# per-pair order actions for one bar
+const ACT_NONE = 0x00      # within the rebalance band: leave it
+const ACT_WAIT = 0x01      # orders in flight toward an earlier target
+const ACT_SUBMIT = 0x02    # trade to target
+const ACT_REPLACE = 0x03   # cancel anything in flight, then trade to target
+
 """
     run_backtest(panel, cfg=BacktestConfig()) -> BacktestResult
 
 Walk-forward statistical-arbitrage backtest. See the module docstring for the event order.
 """
 function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
+    validate_config(cfg, panel)
     n, T = nassets(panel), ntimes(panel)
     F, W = cfg.formation, cfg.health_window
-    W <= F || throw(ArgumentError("health_window must be ≤ formation"))
-    F + 2 <= T || throw(ArgumentError("not enough data for one formation window"))
-    cfg.risk.cov_window < F || throw(ArgumentError("cov_window must be < formation"))
 
     clock = Clock(0)
     sim = ExecutionSimulator(cfg.exec, n)
@@ -293,9 +322,19 @@ function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
         ps = byid[pid]
         leg == 1 ? (ps.sh_y += q) : (ps.sh_x += q)
     end
+    on_split = (a, ratio) -> begin
+        for ps in pairs
+            ps.y == a && (ps.sh_y *= ratio)
+            ps.x == a && (ps.sh_x *= ratio)
+        end
+    end
+    margin_calls = Int[]
+    no_entry_until = 0          # entries blocked before this bar (after a margin call)
+    liquidating = false
 
     # scratch for allocation
     sel = Int[]; sig = Float64[]; kap = Float64[]; w = Float64[]
+    tgt_y = Float64[]; tgt_x = Float64[]; act = UInt8[]
     rets = Vector{SubArray{Float64,1,Matrix{Float64},Tuple{Int,UnitRange{Int}},true}}()
 
     ts = F:T
@@ -305,6 +344,7 @@ function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
         if t > F
             update_vol!(sim, panel, t)
             accrue_financing!(book, panel, cfg.exec, t)
+            apply_corporate_actions!(on_split, sim, book, panel, t)
             process_orders!(on_fill, sim, book, panel, t)
         else
             for τ in 2:t          # seed the impact-model volatility from history
@@ -316,14 +356,31 @@ function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
         end
         for ps in pairs
             ps.created_t == t && continue
+            # a stale (missing / halted) quote carries no new information
+            (panel.tradable[ps.y, t] && panel.tradable[ps.x, t]) || continue
             _update_pair!(ps, panel, cfg, t, egws, jws, gate, health)
         end
+
+        # ── margin check: liquidate everything below maintenance margin ──
+        E = equity(book, panel, t)
+        G = gross_exposure(book, panel, t)
+        liquidate = false
+        if G > 0 && (E <= 0 || E < cfg.risk.maintenance_margin * G)
+            liquidate = true
+            liquidating || push!(margin_calls, t)
+            liquidating = true
+            no_entry_until = E <= 0 ? typemax(Int) : t + cfg.risk.liquidation_cooldown
+        elseif G == 0
+            liquidating = false
+        end
+
         for ps in pairs
-            _update_signal!(ps, cfg, t)
+            can_open = t >= no_entry_until && panel.tradable[ps.y, t] && panel.tradable[ps.x, t]
+            _update_signal!(ps, cfg, t, can_open)
+            liquidate && (ps.signal = 0)
         end
 
         # ── risk allocation ──
-        E = equity(book, panel, t)
         C = cfg.risk.pair_cap * max(E, 0.0)
         empty!(sel); empty!(sig); empty!(kap); empty!(rets)
         for (i, ps) in enumerate(pairs)
@@ -349,24 +406,63 @@ function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
         scale = gross > cfg.risk.max_gross * E ? cfg.risk.max_gross * E / gross : 1.0
 
         # ── orders ──
-        j = 0
-        for (i, ps) in enumerate(pairs)
-            my = panel.mid[ps.y, t]; mx = panel.mid[ps.x, t]
-            if ps.signal != 0
-                j += 1
-                ty, tx = leg_shares(w[j] * C * scale, ps.kf.θ[2], my, mx)
-            else
-                ty, tx = 0.0, 0.0
+        if liquidate
+            for ps in pairs
+                any(o -> o.pair == ps.id, sim.pending) && cancel_pair!(sim, ps.id)
+                (ps.sh_y != 0 || ps.sh_x != 0) &&
+                    submit_pair!(sim, panel, ps.id, (ps.y, ps.x), (-ps.sh_y, -ps.sh_x), t)
             end
-            haspend = any(o -> o.pair == ps.id, sim.pending)
-            dy = ty - ps.sh_y; dx = tx - ps.sh_x
-            if ps.signal != ps.last_signal
-                haspend && cancel_pair!(sim, ps.id)
-                (dy != 0 || dx != 0) && submit_pair!(sim, panel, ps.id, (ps.y, ps.x), (dy, dx), t)
-            elseif !haspend
-                flat_target = ps.signal == 0 && (ps.sh_y != 0 || ps.sh_x != 0)
-                dev = abs(dy) * my + abs(dx) * mx
-                if flat_target || (ps.signal != 0 && dev > cfg.risk.min_trade_frac * C)
+        else
+            # Pass 1: targets and the action the rebalance hysteresis would take. Then
+            # project the gross the book would end up with: pairs that don't trade keep
+            # their holdings (plus anything in flight), pairs that trade go to target.
+            np = length(pairs)
+            resize!(tgt_y, np); resize!(tgt_x, np); resize!(act, np)
+            projected = 0.0
+            j = 0
+            for (i, ps) in enumerate(pairs)
+                my = panel.mid[ps.y, t]; mx = panel.mid[ps.x, t]
+                if ps.signal != 0
+                    j += 1
+                    tgt_y[i], tgt_x[i] = leg_shares(w[j] * C * scale, ps.kf.θ[2], my, mx)
+                else
+                    tgt_y[i], tgt_x[i] = 0.0, 0.0
+                end
+                haspend = any(o -> o.pair == ps.id, sim.pending)
+                dy = tgt_y[i] - ps.sh_y; dx = tgt_x[i] - ps.sh_x
+                act[i] = if ps.signal != ps.last_signal
+                    ACT_REPLACE
+                elseif haspend
+                    ACT_WAIT
+                elseif ps.signal == 0 && (ps.sh_y != 0 || ps.sh_x != 0)
+                    ACT_SUBMIT
+                elseif ps.signal != 0 && abs(dy) * my + abs(dx) * mx > cfg.risk.min_trade_frac * C
+                    ACT_SUBMIT
+                else
+                    ACT_NONE
+                end
+                if act[i] == ACT_REPLACE || act[i] == ACT_SUBMIT
+                    projected += abs(tgt_y[i]) * my + abs(tgt_x[i]) * mx
+                else
+                    projected += abs(ps.sh_y + pending_qty(sim, ps.id, 1)) * my +
+                                 abs(ps.sh_x + pending_qty(sim, ps.id, 2)) * mx
+                end
+            end
+            # Hysteresis must never let the book exceed max_gross: if it would, every open
+            # pair is brought to its (jointly capped) target this bar.
+            if projected > cfg.risk.max_gross * max(E, 0.0) * (1 + 1e-9)
+                for i in 1:np
+                    act[i] == ACT_NONE && (act[i] = ACT_SUBMIT)
+                    act[i] == ACT_WAIT && (act[i] = ACT_REPLACE)
+                end
+            end
+            # Pass 2: send orders
+            for (i, ps) in enumerate(pairs)
+                dy = tgt_y[i] - ps.sh_y; dx = tgt_x[i] - ps.sh_x
+                if act[i] == ACT_REPLACE
+                    any(o -> o.pair == ps.id, sim.pending) && cancel_pair!(sim, ps.id)
+                    (dy != 0 || dx != 0) && submit_pair!(sim, panel, ps.id, (ps.y, ps.x), (dy, dx), t)
+                elseif act[i] == ACT_SUBMIT && (dy != 0 || dx != 0)
                     submit_pair!(sim, panel, ps.id, (ps.y, ps.x), (dy, dx), t)
                 end
             end
@@ -387,5 +483,5 @@ function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
     end
     rets_out = [eq[k] / eq[k-1] - 1 for k in 2:length(eq)]
     BacktestResult(cfg, collect(ts), panel.timestamps[ts], eq, rets_out, bars, health, sim.fills,
-                   formations, book, panel.bars_per_year, panel.symbols)
+                   formations, book, margin_calls, panel.bars_per_year, panel.symbols)
 end

@@ -6,15 +6,17 @@ using Arrow
 using Dates
 
 """
-    load_panel_arrow(path; bars_per_year=252, spread_bps=5, depth_frac=0.01) -> PricePanel
+    load_panel_arrow(path; bars_per_year=252, spread_bps=5, depth_frac=0.01, missing_policy=:error) -> PricePanel
 
 Read a long-format Arrow file (`timestamp, symbol, mid` required; `spread, volume, depth,
 sector` optional). The file is memory-mapped by `Arrow.Table`; it is pivoted once into the
-contiguous `n_assets × T` panel layout used by the backtester. Every (symbol, timestamp)
-cell must be present: an unsynchronised panel is an error, not silently forward-filled.
+contiguous `n_assets × T` panel layout used by the backtester. Absent (symbol, timestamp)
+cells are an error unless `missing_policy = :ffill`, which forward-fills them as
+non-tradable bars (see [`PricePanel`](@ref)).
 """
 function StatArb.load_panel_arrow(path::AbstractString; bars_per_year::Real = 252.0,
-                                            spread_bps::Real = 5.0, depth_frac::Real = 0.01)
+                                            spread_bps::Real = 5.0, depth_frac::Real = 0.01,
+                                            missing_policy::Symbol = :error)
     tbl = Arrow.Table(path)
     cols = propertynames(tbl)
     for c in (:timestamp, :symbol, :mid)
@@ -38,9 +40,8 @@ function StatArb.load_panel_arrow(path::AbstractString; bars_per_year::Real = 25
         D === nothing || (D[i, j] = tbl.depth[r])
         :sector in cols && (sector[i] = tbl.sector[r])
     end
-    any(isnan, M) && throw(ArgumentError("panel is not synchronised: missing (symbol, timestamp) cells"))
     kw = (; symbols = syms, timestamps = times, sector = sector, bars_per_year = bars_per_year,
-          spread_bps = spread_bps, depth_frac = depth_frac)
+          spread_bps = spread_bps, depth_frac = depth_frac, missing_policy = missing_policy)
     PricePanel(M; spread = SP, volume = V, depth = D, kw...)
 end
 

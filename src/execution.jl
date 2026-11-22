@@ -107,12 +107,13 @@ mutable struct Book
     commission_paid::Float64
     borrow_paid::Float64
     interest_net::Float64     # positive = earned
+    dividends_net::Float64    # received on longs minus paid on shorts
     traded_notional::Float64
     n_fills::Int
     n_legged::Int
     n_passive::Int
 end
-Book(cash::Real, n::Integer) = Book(Float64(cash), zeros(n), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0)
+Book(cash::Real, n::Integer) = Book(Float64(cash), zeros(n), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0)
 
 """
     ExecutionSimulator(cfg::ExecConfig, n_assets)
@@ -195,6 +196,10 @@ function process_orders!(on_fill::F, sim::ExecutionSimulator, book::Book, p::Pri
             continue
         end
         a = o.asset
+        if !p.tradable[a, t]          # halted / missing bar: the order just waits
+            i += 1
+            continue
+        end
         m = p.mid[a, t]; h = 0.5 * p.spread[a, t]
         V = p.volume[a, t]; Dp = p.depth[a, t]
         cap = min(cfg.max_participation * V, cfg.depth_levels * Dp)
@@ -264,6 +269,48 @@ function _book_fill!(sim::ExecutionSimulator, book::Book, o::Order, t::Int, q::F
     push!(sim.fills, FillRecord(t, o.submit_t, o.ticket, o.pair, o.leg, o.asset, q, price, m,
                                 o.decision_mid, spread_cost, impact_cost, comm, passive, o.legged))
     nothing
+end
+
+_action_t(x::CorporateAction) = x.t
+_action_t(x::Integer) = x
+
+"""
+    apply_corporate_actions!(on_split, sim, book, panel, t) -> Int
+
+Apply every corporate action whose ex-date is bar `t`, before that bar's fills: the
+dividend is credited on long / debited on short positions (per pre-split share), then
+positions are multiplied by the split ratio and resting orders are rescaled (quantity
+× split, limit and decision prices ÷ split). `on_split(asset, ratio)` lets the caller
+rescale its own per-pair share counts. Returns the number of actions applied.
+"""
+function apply_corporate_actions!(on_split::F, sim::ExecutionSimulator, book::Book, p::PricePanel,
+                                  t::Int) where {F}
+    acts = p.actions
+    i = searchsortedfirst(acts, t; lt = (a, b) -> _action_t(a) < _action_t(b))
+    napplied = 0
+    while i <= length(acts) && acts[i].t == t
+        ca = acts[i]
+        a = ca.asset
+        if ca.dividend != 0.0 && book.pos[a] != 0.0
+            d = ca.dividend * book.pos[a]
+            book.cash += d
+            book.dividends_net += d
+        end
+        if ca.split != 1.0
+            book.pos[a] *= ca.split
+            for j in eachindex(sim.pending)
+                o = sim.pending[j]
+                o.asset == a || continue
+                sim.pending[j] = Order(o.ticket, o.pair, o.leg, o.asset, o.qty * ca.split, o.kind,
+                                       o.limit / ca.split, o.decision_mid / ca.split, o.submit_t,
+                                       o.active_t, o.expire_t, o.legged)
+            end
+            on_split(a, ca.split)
+        end
+        napplied += 1
+        i += 1
+    end
+    napplied
 end
 
 """Outstanding (unfilled) signed quantity for a pair leg."""

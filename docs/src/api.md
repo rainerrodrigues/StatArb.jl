@@ -49,6 +49,13 @@ Modules = [StatArb]
 Pages = ["screening.jl"]
 ```
 
+## Selection with false-discovery control
+
+```@autodocs
+Modules = [StatArb]
+Pages = ["selection.jl"]
+```
+
 ## Portfolio
 
 ```@autodocs
@@ -61,6 +68,13 @@ Pages = ["portfolio.jl"]
 ```@autodocs
 Modules = [StatArb]
 Pages = ["backtest.jl"]
+```
+
+## Configuration validation
+
+```@autodocs
+Modules = [StatArb]
+Pages = ["validate.jl"]
 ```
 
 ## Metrics and reporting

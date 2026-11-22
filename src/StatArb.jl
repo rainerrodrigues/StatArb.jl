@@ -24,14 +24,16 @@ include("johansen.jl")
 include("kalman.jl")
 include("execution.jl")
 include("screening.jl")
+include("selection.jl")
 include("portfolio.jl")
 include("backtest.jl")
+include("validate.jl")
 include("metrics.jl")
 include("synthetic.jl")
 include("stress.jl")
 
 """
-    load_panel_arrow(path; bars_per_year=252, spread_bps=5, depth_frac=0.01) -> PricePanel
+    load_panel_arrow(path; bars_per_year=252, spread_bps=5, depth_frac=0.01, missing_policy=:error) -> PricePanel
 
 Memory-mapped Arrow reader for long-format bar data (`timestamp, symbol, mid` and
 optionally `spread, volume, depth, sector`). Available after `using Arrow` (package extension).
@@ -46,7 +48,7 @@ Write a panel in the long format read by [`load_panel_arrow`](@ref). Requires `u
 function save_panel_arrow end
 
 # data
-export PricePanel, nassets, ntimes, asset_bars, Clock, tick!, assert_past, history, LookaheadError,
+export PricePanel, CorporateAction, nassets, ntimes, asset_bars, Clock, tick!, assert_past, history, LookaheadError,
        MirroredRing, push_column!, window, filled_window, isfull, latest, reset!
 # econometrics
 export OLSWorkspace, ols!, ols_line, ADFResult, adf!, adf_auto!, mackinnon_crit, ou_half_life,
@@ -58,14 +60,16 @@ export KalmanConfig, KalmanHedge, kalman_step, kalman_update!, calibrate_kalman,
        hedge_ratio, intercept, size_multiplier, autocor_lag, ljung_box
 # execution
 export ExecConfig, ExecutionSimulator, Book, Order, FillRecord, OrderKind, MARKET, LIMIT,
-       submit_pair!, process_orders!, accrue_financing!, update_vol!, pending_qty, cancel_pair!,
+       submit_pair!, process_orders!, accrue_financing!, apply_corporate_actions!, update_vol!, pending_qty, cancel_pair!,
        equity, gross_exposure
 # screening / health / parallel
 export distance_screen, test_pairs, PairTest, scan_johansen, rolling_johansen, with_single_threaded_blas,
-       HealthState, ACTIVE, QUARANTINE, RETIRED, HealthGateConfig, healthy, gate_transition
+       HealthState, ACTIVE, QUARANTINE, RETIRED, HealthGateConfig, healthy, gate_transition,
+       NullDistribution, null_pvalue, eg_null_distribution, johansen_null_distribution,
+       benjamini_hochberg, pair_pvalues
 # portfolio / backtest
 export RiskConfig, OverlayWorkspace, overlay_weights!, leg_shares,
-       BacktestConfig, BacktestResult, run_backtest, with
+       BacktestConfig, BacktestResult, FormationRecord, run_backtest, with, validate_config
 # metrics
 export performance, factor_attribution, panel_factors, health_telemetry, cost_breakdown, report, sparkline
 # synthetic / stress

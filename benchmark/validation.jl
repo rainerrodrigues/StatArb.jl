@@ -44,6 +44,30 @@ function lookahead_check(seed)
     res.equity[1:k] == res2.equity[1:k]
 end
 
+# False selections on a universe with no cointegration at all, with and without FDR control
+function noise_selection(seeds, fdr)
+    tot = 0; nform = 0; anysel = 0
+    for s in seeds
+        panel, _ = synthetic_universe(Xoshiro(s); n_pairs = 0, n_noise = 30, T = 1200)
+        res = run_backtest(panel, BacktestConfig(selection_fdr = fdr, threaded_formation = false))
+        for f in res.formations
+            tot += length(f.selected); nform += 1; anysel += !isempty(f.selected)
+        end
+    end
+    tot / nform, anysel / nform
+end
+
+# Calibration of the selection p-values on unscreened null pairs
+function pvalue_calibration(seed, n)
+    rng = Xoshiro(seed)
+    ps = Float64[]
+    for _ in 1:n
+        L = cumsum(randn(rng, 2, 252); dims = 2)
+        append!(ps, pair_pvalues(test_pairs(L, [(1, 2)], 252, 252; threaded = false), 252))
+    end
+    mean(ps .< 0.05)
+end
+
 t0 = time()
 eg, j2, j3 = size_study(11, 4000, 250)
 check("Engle-Granger size (5% test, T=250)", fmt(eg), "0.035 – 0.065", 0.035 <= eg <= 0.065)
@@ -57,6 +81,14 @@ check("β bias, Kalman (true 1.2)", fmt(st.beta_kalman.mean - 1.2), "abs. bias <
 check("half-life median (true 8)", fmt(st.half_life.median), "6.4 – 9.6", 6.4 <= st.half_life.median <= 9.6)
 check("power, Engle-Granger (hl=8, T=500)", fmt(st.power_eg), "≥ 0.90", st.power_eg >= 0.90)
 check("power, Johansen (hl=8, T=500)", fmt(st.power_johansen), "≥ 0.85", st.power_johansen >= 0.85)
+
+loose_n, loose_any = noise_selection(31:42, 0.0)
+fdr_n, fdr_any = noise_selection(31:42, 0.05)
+check("pure noise, per-test 5% selection: spurious pairs / formation", fmt(loose_n), "(reference)", true)
+check("pure noise, FDR 5% selection: spurious pairs / formation", fmt(fdr_n), "≤ 0.15", fdr_n <= 0.15)
+check("pure noise, FDR 5% selection: formations selecting anything", fmt(fdr_any), "≤ 0.10", fdr_any <= 0.10)
+pc = pvalue_calibration(14, 1000)
+check("selection p-values on null pairs: P(p < 0.05)", fmt(pc), "≤ 0.06 (valid)", pc <= 0.06)
 
 rr = vecm_rank_recovery(13, 300)
 check("VECM rank recovery (true r=2)", fmt(rr), "≥ 0.90", rr >= 0.90)

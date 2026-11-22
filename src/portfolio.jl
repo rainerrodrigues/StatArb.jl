@@ -14,6 +14,9 @@
   with small or even opposite weights, i.e. they act mainly as hedges for faster spreads.
 - `cov_window`: bars of spread returns for Σ; `shrinkage` toward the diagonal
 - `min_trade_frac`: rebalance hysteresis (fraction of the pair cap)
+- `maintenance_margin`: minimum equity / gross exposure. Below it (or at non-positive
+  equity) every position is closed at market and new entries are blocked for
+  `liquidation_cooldown` bars (permanently if equity is gone)
 """
 Base.@kwdef struct RiskConfig
     pair_cap::Float64 = 0.10
@@ -23,6 +26,8 @@ Base.@kwdef struct RiskConfig
     cov_window::Int = 60
     shrinkage::Float64 = 0.5
     min_trade_frac::Float64 = 0.25
+    maintenance_margin::Float64 = 0.25
+    liquidation_cooldown::Int = 21
 end
 
 """Pre-allocated buffers for the correlation overlay (grown on demand, never per bar)."""

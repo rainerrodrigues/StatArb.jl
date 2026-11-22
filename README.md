@@ -29,7 +29,7 @@ each layer, and the full API.
 | Workflow | What it checks |
 |---|---|
 | `ci.yml` → `test` | the full test suite (Aqua included) on Julia 1.10, 1.11 and latest on Linux, plus latest on macOS and Windows; coverage goes to Codecov |
-| `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
+| `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery, false selections on pure noise, p-value calibration and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
 | `ci.yml` → `benchmark` | hot-loop latency, allocation counts and backtest throughput, posted to the job summary |
 | `ci.yml` → `jet` | JET static analysis of the whole package (pinned to Julia 1.12) |
 | `docs.yml` | builds the Documenter site, running every example, and deploys it to `gh-pages` |
@@ -39,13 +39,15 @@ each layer, and the full API.
 
 | File | Responsibility |
 |---|---|
-| `src/data.jl` | `PricePanel` (contiguous `n_assets × T` matrices), `MirroredRing` buffers, `Clock` + `LookaheadError` |
+| `src/data.jl` | `PricePanel` (contiguous `n_assets × T` matrices, tradable mask, corporate actions), `MirroredRing` buffers, `Clock` + `LookaheadError` |
 | `src/linalg.jl` | allocation-free Cholesky / triangular solves / OLS workspace |
 | `src/adf.jl` | ADF (fixed & AIC lag), Engle-Granger two-step, MacKinnon (2010) critical values, OU half-life |
 | `src/johansen.jl` | rolling Johansen VECM: trace & max-eigenvalue statistics, rank, cointegrating vector |
 | `src/kalman.jl` | `StaticArrays` Kalman filter for `θ_t = [α_t, β_t]`, innovation Z-scores, uncertainty throttle |
 | `src/execution.jl` | order lifecycle, market/limit fills, impact, participation/depth caps, legging, financing |
 | `src/screening.jl` | distance pre-screen, threaded pair/basket scans, health-gate state machine |
+| `src/selection.jl` | exact null distributions, Monte Carlo p-values, Benjamini-Hochberg FDR control |
+| `src/validate.jl` | configuration validation |
 | `src/portfolio.jl` | pair caps, hedge-ratio leg split, cross-spread mean-variance overlay |
 | `src/backtest.jl` | walk-forward event loop |
 | `src/metrics.jl` | Sharpe/Sortino/MDD/Calmar, factor attribution, health telemetry, text dashboard |
@@ -99,6 +101,20 @@ depends on price units, and on log prices it let the intercept absorb the spread
 - **Financing:** shorts pay borrow fees; short proceeds earn no interest; debit balances pay the margin
   rate.
 
+**Pair selection.** Formation controls the false discovery rate across candidates
+(Benjamini-Hochberg at `selection_fdr = 0.05`). The p-values are exact Monte Carlo p-values for the
+statistics formation actually computes (two-orientation Engle-Granger and the Johansen trace),
+cached per window length, and both tests must reject.
+
+**Data hygiene and risk.**
+- **Gaps:** they raise an error, or with `missing_policy = :ffill` they're forward-filled as
+  non-tradable bars.
+- **Halts and zero-volume bars:** no fills and no new entries.
+- **Corporate actions:** splits and dividends adjust positions, cash and resting orders on the
+  ex-date, while signals use a causally adjusted `logmid`.
+- **Margin:** a breach of `maintenance_margin` triggers a forced liquidation and an entry cooldown.
+- **Config checks:** `validate_config` reports every inconsistent setting at once.
+
 **Health gate.** A pair is moved to *quarantine* (close-only) when the rolling Johansen rank drops to 0
 (`gate_on = :eg` or `:either` are also available) or when its half-life leaves `hl_bounds`. It
 recovers after `recover_checks` consecutive passing checks.
@@ -123,12 +139,14 @@ raw Sharpe of 10.9 drops to 2.9).
 - **Parameter recovery** (300 simulations, β = 1.2, hl = 8): the EG, Johansen and Kalman β estimates
   average 1.1996, 1.1968 and 1.1996. The median half-life comes out at 7.1, a mild downward bias.
   Power is 99.7% for EG and 94% for Johansen.
-- **Execution style:** market orders give a Sharpe of 2.71 after costs. Passive limits give −1.81:
-  adverse selection and 147 legged fills cost about 46 bps against roughly 4 bps.
-- **Misspecification:** overestimating reversion speed 4× costs 0.73 Sharpe; underestimating it 4×
-  costs 0.04. Short health windows (W = 60/120) don't have the power to keep pairs out of quarantine,
-  so Sharpe drops to 0.85 and 1.51.
-- **Telemetry:** the Kalman innovation ACF(1) is about 0.74 because the planted spreads are OU
+- **Execution style:** market orders give a Sharpe of 2.11 after costs. Passive limits give −1.39:
+  adverse selection and 88 legged fills cost about 42 bps against roughly 4 bps.
+- **Misspecification:** overestimating reversion speed 4× costs 0.87 Sharpe; underestimating it 4×
+  costs 0.09. Short health windows (W = 60/120) don't have the power to keep pairs out of quarantine,
+  so Sharpe drops to 0.16 and 1.32.
+- **Pair selection:** with false-discovery control, a universe of pure random walks yields 0.02
+  spurious pairs per formation, against 2.6 with plain per-test selection (see the CI validation job).
+- **Telemetry:** the Kalman innovation ACF(1) is about 0.69 because the planted spreads are OU
   processes, which the random-walk-coefficient model treats as white noise. This is exactly the kind
   of misspecification the dashboard is there to surface.
 

@@ -1,6 +1,6 @@
 using Aqua
 using StatArb
-using StatArb: chol!, cholsolve!, _book_fill!
+using StatArb: chol!, cholsolve!, _book_fill!, Order
 using Test, Random, LinearAlgebra, Statistics, Dates, StaticArrays
 
 # Independent (allocating, textbook) Johansen with restricted constant, used as a reference.
@@ -318,6 +318,166 @@ end
     @test res.equity[end] != res2.equity[end]
 end
 
+@testset "FDR-controlled selection" begin
+    nd = NullDistribution(collect(1.0:99.0), :lower)
+    @test null_pvalue(nd, 0.5) == 1 / 100                 # more extreme than every draw
+    @test null_pvalue(nd, 50.0) == 51 / 100
+    @test null_pvalue(NullDistribution(collect(1.0:99.0), :upper), 99.5) == 1 / 100
+    @test null_pvalue(nd, NaN) == 1.0
+    @test_throws ArgumentError NullDistribution([1.0], :both)
+    # Benjamini-Hochberg reference example
+    p = [0.010, 0.039, 0.040, 0.041, 0.300, 0.0001]
+    @test benjamini_hochberg(p, 0.05) == BitVector([1, 1, 1, 1, 0, 1])
+    @test benjamini_hochberg([0.2, 0.3], 0.05) == falses(2)
+    @test isempty(benjamini_hochberg(Float64[], 0.05))
+    # cached, deterministic null distributions of the two-orientation statistic
+    e1 = eg_null_distribution(200; nsim = 2000)
+    @test e1 === eg_null_distribution(200; nsim = 2000)
+    q05 = e1.stats[round(Int, 0.05 * 2000)]
+    @test q05 < mackinnon_crit(2, 200)[2]                 # min over orientations is more extreme
+    @test -4.2 < q05 < -3.4
+    j1 = johansen_null_distribution(200; nsim = 2000)
+    @test 18 < j1.stats[round(Int, 0.95 * 2000)] < 23      # ≈ Osterwald-Lenum 19.96
+    # on a pure-noise universe FDR control removes almost every spurious pair
+    panel, _ = synthetic_universe(Xoshiro(31); n_pairs = 0, n_noise = 30, T = 900)
+    nsel(fdr) = sum(length(f.selected) for f in
+                    run_backtest(panel, BacktestConfig(selection_fdr = fdr, threaded_formation = false)).formations)
+    loose, strict = nsel(0.0), nsel(0.05)
+    @test loose >= 5
+    @test strict <= 1
+end
+
+@testset "config validation" begin
+    @test validate_config(BacktestConfig()) === nothing
+    err = try
+        validate_config(BacktestConfig(z_entry = 0.4, z_exit = 0.5, health_window = 300,
+                                       exec = ExecConfig(latency = 0), risk = RiskConfig(pair_cap = 2.0)))
+        ""
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("z_exit < z_entry", err)
+    @test occursin("health_window (300) must be ≤ formation", err)
+    @test occursin("exec.latency", err)
+    @test occursin("pair_cap (2.0) cannot exceed", err)
+    @test_throws ArgumentError validate_config(BacktestConfig(hl_bounds = (1.0, 200.0)))
+    @test_throws ArgumentError validate_config(BacktestConfig(coint_level = 0.03))
+    @test_throws ArgumentError validate_config(BacktestConfig(risk = RiskConfig(maintenance_margin = 0.5, max_gross = 2.5, pair_cap = 0.1)))
+    small = PricePanel(fill(10.0, 2, 100))
+    @test_throws ArgumentError run_backtest(small)
+    @test_throws ArgumentError validate_config(BacktestConfig(exec = ExecConfig(borrow_rates = [0.01])),
+                                               PricePanel(fill(10.0, 2, 300)))
+end
+
+@testset "missing data and halts" begin
+    m = fill(10.0, 2, 6)
+    m[1, 3] = NaN; m[2, 1] = NaN
+    @test_throws ArgumentError PricePanel(m)
+    p = PricePanel(m; missing_policy = :ffill)
+    @test p.mid[1, 3] == 10.0 && p.mid[2, 1] == 10.0
+    @test !p.tradable[1, 3] && !p.tradable[2, 1] && p.tradable[1, 2]
+    @test p.volume[1, 3] == 0 && p.depth[1, 3] == 0
+    pm = PricePanel(Union{Missing,Float64}[10.0 missing 11.0]; missing_policy = :ffill)
+    @test pm.mid == [10.0 10.0 11.0] && pm.tradable == BitMatrix([1 0 1])
+    @test_throws ArgumentError PricePanel([NaN NaN]; missing_policy = :ffill)
+    # zero volume and an explicit halt mask are non-tradable too
+    v = fill(1e5, 2, 6); v[2, 4] = 0
+    halt = trues(2, 6); halt[1, 5] = false
+    ph = PricePanel(fill(10.0, 2, 6); volume = v, tradable = halt)
+    @test !ph.tradable[2, 4] && !ph.tradable[1, 5]
+    # orders wait through a halt and fill on the next tradable bar
+    sim = ExecutionSimulator(ExecConfig(commission_bps = 0.0), 2); book = Book(1e6, 2)
+    submit_pair!(sim, ph, 1, (1, 2), (100.0, 0.0), 4)
+    process_orders!((a...) -> nothing, sim, book, ph, 5)
+    @test book.pos[1] == 0 && length(sim.pending) == 1
+    process_orders!((a...) -> nothing, sim, book, ph, 6)
+    @test book.pos[1] == 100
+    # a full backtest on gappy data: no fill ever lands on a non-tradable bar
+    panel, _ = synthetic_universe(Xoshiro(41); T = 1000)
+    mid = copy(panel.mid)
+    rng = Xoshiro(42)
+    for _ in 1:400
+        mid[rand(rng, 1:size(mid, 1)), rand(rng, 260:1000)] = NaN
+    end
+    gp = PricePanel(mid; volume = panel.volume, depth = panel.depth, sector = panel.sector, missing_policy = :ffill)
+    res = run_backtest(gp)
+    @test res.book.n_fills > 0
+    @test all(gp.tradable[f.asset, f.t] for f in res.fills)
+    @test all(isfinite, res.equity)
+end
+
+@testset "gross cap holds through rebalance hysteresis" begin
+    # Regression: existing pairs' downsizing fell inside the rebalance band while a new
+    # pair opened at full size, so the book ran above max_gross.
+    panel, _ = synthetic_universe(Xoshiro(61); T = 1000)
+    for mg in (1.0, 2.0)
+        cfg = BacktestConfig(risk = RiskConfig(pair_cap = mg, max_gross = mg, correlation_overlay = false,
+                                               throttle_uncertainty = false))
+        r = run_backtest(panel, cfg)
+        # targets are capped at decision time; allow one bar of price drift between
+        # decision and valuation
+        @test maximum(r.bars.gross ./ r.bars.equity) < mg * 1.05
+    end
+end
+
+@testset "corporate actions" begin
+    T = 10
+    raw = fill(100.0, 1, T); raw[1, 6:end] .= 50.0                   # 2-for-1 split on bar 6
+    p = PricePanel(raw; actions = [CorporateAction(1, 6; split = 2.0)])
+    @test p.logmid[1, :] ≈ fill(log(100.0), T)                         # continuous adjusted series
+    @test p.logmid[1, 1:5] == log.(raw[1, 1:5])                       # causal: the past is untouched
+    @test_throws ArgumentError PricePanel(raw; actions = [CorporateAction(1, 1; split = 2.0)])
+    @test_throws ArgumentError PricePanel(raw; actions = [CorporateAction(1, 6; dividend = 150.0)])
+    # dividend adjustment: total-return continuity
+    rawd = fill(100.0, 1, T); rawd[1, 6:end] .= 98.0
+    pd = PricePanel(rawd; actions = [CorporateAction(1, 6; dividend = 2.0)])
+    @test pd.logmid[1, 6] ≈ log(100.0)
+    # positions, cash and resting orders on the ex-date
+    p2 = PricePanel(fill(100.0, 2, T); actions = [CorporateAction(1, 6; split = 2.0, dividend = 1.0),
+                                                  CorporateAction(2, 6; dividend = 0.5)])
+    sim = ExecutionSimulator(ExecConfig(), 2); book = Book(0.0, 2)
+    book.pos .= [100.0, -40.0]
+    push!(sim.pending, Order(1, 1, 1, 1, 10.0, LIMIT, 99.0, 100.0, 5, 6, 7, false))
+    rescaled = Float64[]
+    n = apply_corporate_actions!((a, r) -> push!(rescaled, r), sim, book, p2, 6)
+    @test n == 2
+    @test book.pos == [200.0, -40.0]
+    @test book.cash ≈ 100 * 1.0 - 40 * 0.5
+    @test book.dividends_net ≈ 80.0
+    @test sim.pending[1].qty == 20.0 && sim.pending[1].limit == 49.5
+    @test rescaled == [2.0]
+    @test apply_corporate_actions!((a, r) -> nothing, sim, book, p2, 7) == 0
+    # a split in the raw data changes nothing economically
+    panel, _ = synthetic_universe(Xoshiro(51); T = 1000)
+    a, ts = 1, 700
+    mid = copy(panel.mid); vol = copy(panel.volume); dep = copy(panel.depth); spr = copy(panel.spread)
+    mid[a, ts:end] ./= 2; spr[a, ts:end] ./= 2; vol[a, ts:end] .*= 2; dep[a, ts:end] .*= 2
+    ps = PricePanel(mid; spread = spr, volume = vol, depth = dep, sector = panel.sector,
+                    actions = [CorporateAction(a, ts; split = 2.0)])
+    @test ps.logmid ≈ panel.logmid
+    r0 = run_backtest(panel); r1 = run_backtest(ps)
+    @test r1.equity ≈ r0.equity rtol = 1e-3                          # only share rounding differs
+end
+
+@testset "margin limit and forced liquidation" begin
+    panel, _ = synthetic_universe(Xoshiro(61); T = 1000)
+    cfg = BacktestConfig(risk = RiskConfig(pair_cap = 2.0, max_gross = 2.0, maintenance_margin = 0.4,
+                                           correlation_overlay = false, throttle_uncertainty = false,
+                                           liquidation_cooldown = 15))
+    r0 = run_backtest(panel, cfg)
+    @test isempty(r0.margin_calls)
+    f = r0.fills[findfirst(x -> x.qty > 0, r0.fills)]                # first long fill
+    mid = copy(panel.mid)
+    mid[f.asset, f.t+1:end] .*= 0.5                                   # the long leg halves overnight
+    crash = PricePanel(mid; spread = panel.spread, volume = panel.volume, depth = panel.depth, sector = panel.sector)
+    r1 = run_backtest(crash, cfg)
+    @test first(r1.margin_calls) == f.t + 1
+    k = findfirst(==(f.t + 1), r1.t)
+    @test r1.bars.n_open[k+2] == 0                                    # flat once the closes fill
+    @test all(==(0), r1.bars.n_open[k+2:k+14])                         # no new entries in the cooldown
+    @test occursin("Margin calls", sprint(io -> report(io, r1)))
+end
+
 @testset "synthetic ground truth recovery" begin
     st = recovery_study(Xoshiro(8); nsim = 200, T = 500, beta = 1.2, half_life = 8.0)
     @test st.beta_eg.mean ≈ 1.2 atol = 0.02
@@ -348,6 +508,13 @@ end
     @test p2.volume ≈ panel.volume
     @test p2.timestamps == panel.timestamps
     @test p2.sector == panel.sector
+    # an absent (symbol, timestamp) cell: rejected by default, forward-filled on request
+    gpath = tempname() * ".arrow"
+    Arrow.write(gpath, (timestamp = [DateTime(2020, 1, d) for d in (1, 2, 3, 1, 3)],
+                        symbol = ["A", "A", "A", "B", "B"], mid = [10.0, 11.0, 12.0, 20.0, 21.0]))
+    @test_throws ArgumentError load_panel_arrow(gpath)
+    pg = load_panel_arrow(gpath; missing_policy = :ffill)
+    @test pg.mid[2, :] == [20.0, 20.0, 21.0] && !pg.tradable[2, 2]
 end
 
 end

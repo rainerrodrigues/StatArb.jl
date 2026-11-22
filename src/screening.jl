@@ -37,14 +37,15 @@ function foreach_chunk(f, n::Integer; threaded::Bool = true)
 end
 
 """
-    distance_screen(logp, t, W; top=100, sector=nothing, same_sector=true) -> Vector{NTuple{2,Int}}
+    distance_screen(logp, t, W; top=100, sector=nothing, same_sector=true, eligible=nothing) -> Vector{NTuple{2,Int}}
 
 Gatev-style pre-screen: z-normalise each asset's log price over the window ending at `t`
 and keep the `top` pairs with the smallest sum of squared differences. Optionally restrict
-to pairs within the same sector. Cuts the O(N²) cointegration workload to `top` tests.
+to pairs within the same sector, and to `eligible` assets (a Bool vector). Cuts the O(N²)
+cointegration workload to `top` tests.
 """
 function distance_screen(logp::AbstractMatrix, t::Integer, W::Integer; top::Integer = 100,
-                         sector = nothing, same_sector::Bool = true)
+                         sector = nothing, same_sector::Bool = true, eligible = nothing)
     n = size(logp, 1)
     t - W + 1 >= 1 || throw(ArgumentError("not enough history"))
     Z = Matrix{Float64}(undef, W, n)            # column per asset: contiguous inner loop
@@ -68,6 +69,7 @@ function distance_screen(logp::AbstractMatrix, t::Integer, W::Integer; top::Inte
     dists = Float64[]
     for i in 1:n-1, j in i+1:n
         (same_sector && sector !== nothing && sector[i] != sector[j]) && continue
+        (eligible !== nothing && !(eligible[i] && eligible[j])) && continue
         d = 0.0
         @inbounds @simd for s in 1:W
             d += (Z[s, i] - Z[s, j])^2

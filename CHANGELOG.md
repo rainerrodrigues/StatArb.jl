@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Robustness
+
+- **False-discovery control in pair selection** (`selection_fdr = 0.05` by default):
+  exact Monte Carlo p-values for the two-orientation Engle-Granger statistic and the
+  Johansen trace (cached per window length), combined so both tests must reject, then
+  Benjamini-Hochberg. On pure noise this cuts spurious selections from 2.6 to 0.04 pairs
+  per formation. New: `NullDistribution`, `null_pvalue`, `eg_null_distribution`,
+  `johansen_null_distribution`, `benjamini_hochberg`, `pair_pvalues`.
+- **Config validation**: `validate_config` reports every inconsistency at once, and
+  `run_backtest` calls it first.
+- **Missing data and halts**: `PricePanel(...; missing_policy = :ffill)` forward-fills
+  gaps as non-tradable bars; `panel.tradable` (gaps, zero volume, optional halt mask)
+  blocks fills, filter updates and new entries; formation needs `min_tradable_frac` real
+  bars. The Arrow loader accepts `missing_policy` as well.
+- **Corporate actions**: `CorporateAction(asset, t; split, dividend)`; raw prices for
+  execution, causally adjusted `logmid` for signals; positions, cash and resting orders
+  are adjusted on the ex-date.
+- **Margin**: `risk.maintenance_margin` and `risk.liquidation_cooldown`; forced
+  liquidation is reported in `res.margin_calls` and on the dashboard.
+- **Fix**: rebalance hysteresis could let the book exceed `max_gross` when a new pair
+  opened while the existing pairs' required downsizing fell inside the rebalance band.
+  The projected gross is now checked, and downsizing is forced whenever needed.
+- Validation job: false-selection rate on pure noise and p-value calibration.
+
+### Infrastructure
+
 - CI on Julia 1.10, 1.11 and latest across Linux, macOS and Windows, with
   coverage, a benchmark job, Monte Carlo statistical validation, and JET
   static analysis. Documenter site, TagBot and CompatHelper.

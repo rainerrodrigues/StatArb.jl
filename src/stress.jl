@@ -10,7 +10,8 @@ One-at-a-time perturbation sweep around `base`:
 
 - `q_scales`  multiply the Kalman state-noise `Q`
 - `r_scales`  multiply the observation noise `R`
-- `windows`   rolling health-check lookbacks `W`
+- `windows`   rolling health-check lookbacks `W` (the half-life upper bound is lowered to
+  just under `W/2` where needed, since longer half-lives can't be estimated on `W` bars)
 - `hl_scales` multiply every estimated half-life used for time stops and the overlay's
   reversion speeds (< 1 ⇒ *over*-estimating reversion speed)
 
@@ -30,7 +31,10 @@ function sensitivity_sweep(panel::PricePanel, base::BacktestConfig = BacktestCon
         push!(specs, (:r_scale, r, with(base; kalman = with(base.kalman; r_scale = r))))
     end
     for w in windows
-        w <= base.formation && push!(specs, (:health_window, w, with(base; health_window = w)))
+        w <= base.formation || continue
+        lo, hi = base.hl_bounds
+        hb = (lo, min(hi, w / 2 - 1))
+        push!(specs, (:health_window, w, with(base; health_window = w, hl_bounds = hb)))
     end
     for h in hl_scales
         push!(specs, (:hl_scale, h, with(base; hl_scale = h)))

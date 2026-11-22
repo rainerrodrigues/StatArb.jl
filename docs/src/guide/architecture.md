@@ -20,8 +20,10 @@ about cointegration. They only meet inside the event loop.
 [`run_backtest`](@ref) moves a single monotonic [`Clock`](@ref) forward one bar at a time.
 At bar `t` it:
 
-1. fills orders decided at or before `t − latency`, using bar-`t` quotes, volume and depth;
-2. accrues borrow fees and interest for the interval `(t−1, t]`;
+1. accrues borrow fees and interest for the interval `(t−1, t]`, applies that bar's
+   corporate actions, then fills orders decided at or before `t − latency` using bar-`t`
+   quotes, volume and depth (halted bars don't fill);
+2. checks maintenance margin and liquidates if it's breached;
 3. every `trading` bars, re-runs formation on `[t−F+1, t]`: distance screen, then
    Engle-Granger and Johansen, then pair selection, then Kalman calibration;
 4. for each pair, pushes bar `t` into its ring buffer, updates the Kalman filter and, every
@@ -41,6 +43,18 @@ At bar `t` it:
 - **Perturbation test.** The test suite scrambles every price after bar 800 and checks that
   the equity curve up to bar 800 is *bit-identical*. That check catches leaks the other
   guardrails can't, such as a statistic accidentally computed over the full sample.
+
+## Data hygiene
+
+[`PricePanel`](@ref) validates its input:
+- timestamps must strictly increase;
+- prices must be finite and positive, and microstructure fields finite and non-negative.
+
+Gaps either raise an error (`missing_policy = :error`, the default) or are forward-filled
+as non-tradable bars (`:ffill`). [`validate_config`](@ref) checks a configuration before
+any work starts and reports every problem at once, for example `z_exit ≥ z_entry`,
+`latency < 1`, a half-life bound longer than the window can estimate, or a leverage and
+margin combination that would start in a margin call.
 
 ## Mirrored ring buffers
 
