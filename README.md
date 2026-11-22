@@ -1,5 +1,10 @@
 # StatArb.jl
 
+[![CI](https://github.com/rainerrodrigues/StatArb.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/rainerrodrigues/StatArb.jl/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://rainerrodrigues.github.io/StatArb.jl/dev/)
+[![codecov](https://codecov.io/gh/rainerrodrigues/StatArb.jl/graph/badge.svg)](https://codecov.io/gh/rainerrodrigues/StatArb.jl)
+[![Aqua QA](https://raw.githubusercontent.com/JuliaTesting/Aqua.jl/master/badge.svg)](https://github.com/JuliaTesting/Aqua.jl)
+
 A statistical-arbitrage backtester that keeps **econometric health monitoring** (rolling
 Engle-Granger / Johansen cointegration, OU half-life, Kalman state-space hedge ratios)
 separate from **multi-leg execution simulation** (latency, spread, square-root impact,
@@ -15,6 +20,20 @@ sw  = sensitivity_sweep(panel)                # Q / R / window / half-life missp
 ```
 
 Run with threads for parallel formation scans and sweeps: `julia --project=. -t auto`.
+
+📖 **[Documentation](https://rainerrodrigues.github.io/StatArb.jl/dev/)**: tutorials, guides for
+each layer, and the full API.
+
+## Continuous integration
+
+| Workflow | What it checks |
+|---|---|
+| `ci.yml` → `test` | the full test suite (Aqua included) on Julia 1.10, 1.11 and latest on Linux, plus latest on macOS and Windows; coverage goes to Codecov |
+| `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
+| `ci.yml` → `benchmark` | hot-loop latency, allocation counts and backtest throughput, posted to the job summary |
+| `ci.yml` → `jet` | JET static analysis of the whole package (pinned to Julia 1.12) |
+| `docs.yml` | builds the Documenter site, running every example, and deploys it to `gh-pages` |
+| `TagBot.yml`, `CompatHelper.yml` | release tagging and dependency compat bumps |
 
 ## Layout
 

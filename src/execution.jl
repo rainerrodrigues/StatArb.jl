@@ -14,7 +14,15 @@
 # unfilled remainders roll forward (partial fills).
 # ─────────────────────────────────────────────────────────────────────────────
 
+"""
+    OrderKind
+
+`MARKET` crosses the spread and pays square-root impact; `LIMIT` rests at the touch and
+fills only on a strict trade-through.
+"""
 @enum OrderKind MARKET LIMIT
+@doc "Aggressive order: half spread + square-root impact." MARKET
+@doc "Passive order resting at the decision-time touch." LIMIT
 
 """
     ExecConfig(; ...)
@@ -49,6 +57,13 @@ Base.@kwdef struct ExecConfig
     vol_halflife::Float64 = 20.0
 end
 
+"""
+    Order
+
+A resting or in-flight leg order. `qty` is the remaining signed share quantity; the order
+may fill from bar `active_t` (decision bar + latency); a `LIMIT` converts to `MARKET`
+after `expire_t`; `legged` marks a leg that is being crossed because its sibling filled.
+"""
 struct Order
     ticket::Int
     pair::Int
@@ -99,6 +114,12 @@ mutable struct Book
 end
 Book(cash::Real, n::Integer) = Book(Float64(cash), zeros(n), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0)
 
+"""
+    ExecutionSimulator(cfg::ExecConfig, n_assets)
+
+Holds pending orders, the columnar fill log (`fills::StructVector{FillRecord}`) and the
+per-asset EWMA volatility used by the impact model.
+"""
 mutable struct ExecutionSimulator
     cfg::ExecConfig
     pending::Vector{Order}
@@ -293,6 +314,7 @@ function equity(book::Book, p::PricePanel, t::Int)
     e
 end
 
+"""Gross market value `Σ |position| · mid` at bar t."""
 function gross_exposure(book::Book, p::PricePanel, t::Int)
     g = 0.0
     @inbounds for a in eachindex(book.pos)

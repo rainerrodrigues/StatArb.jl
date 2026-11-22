@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Cancel superseded runs on the same branch / PR
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Julia ${{ matrix.julia-version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    env:
+      # Exercise the threaded formation scans and sweeps
+      JULIA_NUM_THREADS: 2
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.10 is the oldest Julia StatArb supports (Project.toml [compat])
+        julia-version: ['1.10', '1.11', '1']
+        os: [ubuntu-latest]
+        include:
+          - julia-version: '1'
+            os: macos-latest
+          - julia-version: '1'
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+      - uses: julia-actions/julia-processcoverage@v1
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # Fail loudly on main once the secret is configured; forks can't see it
+          fail_ci_if_error: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CODECOV_TOKEN != '' }}
+
+  benchmark:
+    # Hot-loop latency, allocation counts and full-backtest throughput. Reported in
+    # the job summary; it doesn't fail the build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Run the hot-loop benchmark
+        run: |
+          julia --project benchmark/hotloops.jl | tee bench.txt
+          { echo '### Hot-loop benchmark'; echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  validation:
+    # Monte Carlo checks of the econometrics, too slow for the unit tests: test size
+    # and power, parameter-recovery bias, VECM rank recovery and a multi-seed lookahead
+    # perturbation check. Fails the build when any check leaves its tolerance.
+    runs-on: ubuntu-latest
+    env:
+      JULIA_NUM_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Statistical validation
+        run: |
+          set -o pipefail
+          julia --project benchmark/validation.jl | tee validation.md
+          { echo '### Statistical validation'; cat validation.md; } >> "$GITHUB_STEP_SUMMARY"
+
+  jet:
+    # Static analysis: fails when JET finds possible errors (undefined names,
+    # calls that can't dispatch, nothing-related mistakes). Pinned to 1.12
+    # because JET tracks Julia's compiler internals and lags new releases.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - name: Run JET
+        run: |
+          julia -e '
+            using Pkg
+            Pkg.activate(temp = true)
+            Pkg.develop(path = pwd()); Pkg.add("JET")
+            using JET, StatArb
+            r = JET.report_package(StatArb; target_modules = (StatArb,), toplevel_logger = nothing)
+            show(stdout, MIME"text/plain"(), r)
+            isempty(JET.get_reports(r)) || exit(1)'

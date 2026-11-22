@@ -178,8 +178,16 @@ end
 
 # ─── Health gate ─────────────────────────────────────────────────────────────
 
-"""Lifecycle of a traded pair."""
+"""
+    HealthState
+
+Lifecycle of a traded pair: `ACTIVE` (may open positions), `QUARANTINE` (close-only until
+the health checks recover) and `RETIRED` (dropped from the universe and flat).
+"""
 @enum HealthState ACTIVE QUARANTINE RETIRED
+@doc "Pair passes its health checks and may open positions." ACTIVE
+@doc "Pair failed a health check: close-only until it recovers." QUARANTINE
+@doc "Pair left the universe and has been closed out." RETIRED
 
 """
     HealthGateConfig(; hl_bounds=(1, 60), gate_on=:johansen, recover_checks=2, level=0.05)

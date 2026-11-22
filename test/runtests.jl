@@ -1,3 +1,4 @@
+using Aqua
 using StatArb
 using StatArb: chol!, cholsolve!, _book_fill!
 using Test, Random, LinearAlgebra, Statistics, Dates, StaticArrays
@@ -28,6 +29,10 @@ end
 
 @testset "StatArb" begin
 
+@testset "Aqua code quality" begin
+    Aqua.test_all(StatArb)
+end
+
 @testset "data layer & temporal guardrails" begin
     @test_throws ArgumentError PricePanel([1.0 2.0; 3.0 -1.0])
     @test_throws ArgumentError PricePanel(ones(2, 3); timestamps = [DateTime(2020, 1, 3), DateTime(2020, 1, 2), DateTime(2020, 1, 4)])
@@ -41,6 +46,9 @@ end
     @test_throws LookaheadError assert_past(c, 11)
     @test size(history(p, c, 5)) == (3, 5)
     @test_throws ArgumentError history(p, c, 11)
+    @test history(p, c, 2, 5; field = :mid) == fill(10.0, 5)
+    @test_throws ArgumentError history(p, c, 5; field = :bars_per_year)
+    @test_throws ArgumentError latest(MirroredRing(1, 3))
 
     # mirrored ring == naive last-W window, always contiguous & chronological
     r = MirroredRing(2, 7)
@@ -90,7 +98,8 @@ end
         s[t] = φ * s[t-1] + randn(rng)
     end
     @test ou_half_life(s) ≈ 8 rtol = 0.1
-    @test ou_half_life(cumsum(randn(rng, 2000)) .+ collect(1:2000)) == Inf
+    @test ou_half_life(1.01 .^ (1:200)) == Inf                    # explosive: φ > 1
+    @test ou_half_life(fill(3.0, 50)) == Inf                       # constant: no variation
     # ADF on white noise strongly rejects; auto-lag works
     ows = OLSWorkspace(500, 8)
     @test adf!(ows, randn(rng, 500), 1).stat < -10
@@ -288,6 +297,11 @@ end
     @test occursin("MODEL HEALTH", s) && occursin("FACTOR ATTRIBUTION", s)
     # fills never happen before decision + latency
     @test all(res.fills.t .>= res.fills.submit_t .+ cfg.exec.latency)
+    # a pair is tracked by its asset set: never two live states on the same two assets
+    for f in res.formations
+        @test length(unique(minmax(p...) for p in f.selected)) == length(f.selected)
+    end
+    @test allunique(minmax(h.y, h.x) => h.t for h in res.health)
     # passive style runs and records passive / legged fills
     resp = run_backtest(panel, with(cfg; exec = ExecConfig(style = :passive)))
     @test resp.book.n_passive > 0

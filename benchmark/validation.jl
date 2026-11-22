@@ -1,0 +1,73 @@
+# Statistical validation of the econometric engine: Monte Carlo studies that are too
+# slow for the unit tests. Prints a Markdown table and exits non-zero if any check falls
+# outside its tolerance.
+#   julia --project -t auto benchmark/validation.jl
+using StatArb, Random, Statistics, Printf
+
+const RESULTS = Tuple{String,String,String,Bool}[]
+check(name, value, target, ok) = push!(RESULTS, (name, value, target, ok))
+fmt(x) = @sprintf("%.4f", x)
+
+function size_study(seed, nsim, T)
+    rng = Xoshiro(seed)
+    eg = EGWorkspace(T, 4)
+    j2 = JohansenWorkspace(2, T); j3 = JohansenWorkspace(3, T)
+    re = rj2 = rj3 = 0
+    for _ in 1:nsim
+        y, x = cumsum(randn(rng, T)), cumsum(randn(rng, T))
+        re += iscointegrated(engle_granger!(eg, y, x))
+        rj2 += johansen!(j2, cumsum(randn(rng, 2, T); dims = 2)).rank > 0
+        rj3 += johansen!(j3, cumsum(randn(rng, 3, T); dims = 2)).rank > 0
+    end
+    re / nsim, rj2 / nsim, rj3 / nsim
+end
+
+function vecm_rank_recovery(seed, nsim)
+    rng = Xoshiro(seed)
+    β = [1.0 0.0; 0.0 1.0; -0.6 -0.8]
+    α = [-0.15 0.0; 0.05 -0.2; 0.05 0.1]
+    count(_ -> johansen(simulate_vecm(rng, 600, α, β)).rank == 2, 1:nsim) / nsim
+end
+
+function lookahead_check(seed)
+    rng = Xoshiro(seed)
+    panel, _ = synthetic_universe(rng; n_pairs = 6, n_noise = 6, T = 900)
+    cfg = BacktestConfig(threaded_formation = false)
+    res = run_backtest(panel, cfg)
+    tcut = 650
+    mid = copy(panel.mid)
+    mid[:, tcut+1:end] .*= exp.(0.05 .* randn(rng, size(mid, 1), ntimes(panel) - tcut))
+    p2 = PricePanel(mid; symbols = panel.symbols, timestamps = panel.timestamps, spread = panel.spread,
+                    volume = panel.volume, depth = panel.depth, sector = panel.sector)
+    res2 = run_backtest(p2, cfg)
+    k = findfirst(==(tcut), res.t)
+    res.equity[1:k] == res2.equity[1:k]
+end
+
+t0 = time()
+eg, j2, j3 = size_study(11, 4000, 250)
+check("Engle-Granger size (5% test, T=250)", fmt(eg), "0.035 – 0.065", 0.035 <= eg <= 0.065)
+check("Johansen k=2 size (5% test, T=250)", fmt(j2), "0.03 – 0.09", 0.03 <= j2 <= 0.09)
+check("Johansen k=3 size (5% test, T=250)", fmt(j3), "≤ 0.10", j3 <= 0.10)
+
+st = recovery_study(Xoshiro(12); nsim = 1000, T = 500, beta = 1.2, half_life = 8.0)
+check("β bias, Engle-Granger (true 1.2)", fmt(st.beta_eg.mean - 1.2), "abs. bias < 0.01", abs(st.beta_eg.mean - 1.2) < 0.01)
+check("β bias, Johansen (true 1.2)", fmt(st.beta_johansen.mean - 1.2), "abs. bias < 0.02", abs(st.beta_johansen.mean - 1.2) < 0.02)
+check("β bias, Kalman (true 1.2)", fmt(st.beta_kalman.mean - 1.2), "abs. bias < 0.01", abs(st.beta_kalman.mean - 1.2) < 0.01)
+check("half-life median (true 8)", fmt(st.half_life.median), "6.4 – 9.6", 6.4 <= st.half_life.median <= 9.6)
+check("power, Engle-Granger (hl=8, T=500)", fmt(st.power_eg), "≥ 0.90", st.power_eg >= 0.90)
+check("power, Johansen (hl=8, T=500)", fmt(st.power_johansen), "≥ 0.85", st.power_johansen >= 0.85)
+
+rr = vecm_rank_recovery(13, 300)
+check("VECM rank recovery (true r=2)", fmt(rr), "≥ 0.90", rr >= 0.90)
+
+la = all(lookahead_check(s) for s in 21:23)
+check("lookahead: future perturbation leaves past equity identical (3 seeds)", string(la), "true", la)
+
+println("| Check | Value | Target | |")
+println("|---|---|---|---|")
+for (n, v, t, ok) in RESULTS
+    println("| ", n, " | ", v, " | ", t, " | ", ok ? "✅" : "❌", " |")
+end
+@printf("\nCompleted in %.1f s with %d thread(s).\n", time() - t0, Threads.nthreads())
+all(r -> r[4], RESULTS) || exit(1)

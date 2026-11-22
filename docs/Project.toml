@@ -1,0 +1,9 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+StatArb = "29e224ac-e7f4-4780-96e2-30e66da721b2"
+
+[sources]
+StatArb = {path = ".."}
+
+[compat]
+Documenter = "1"

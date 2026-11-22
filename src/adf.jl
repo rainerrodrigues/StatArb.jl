@@ -35,6 +35,12 @@ end
 @inline _level_index(level) = level == 0.01 ? 1 : level == 0.05 ? 2 : level == 0.10 ? 3 :
     throw(ArgumentError("level must be 0.01, 0.05 or 0.10"))
 
+"""
+    ADFResult
+
+Augmented Dickey-Fuller regression output: `stat` (t-statistic on γ), `gamma`, `lags`,
+`nobs` and the residual sum of squares `sse`.
+"""
 struct ADFResult
     stat::Float64     # t-statistic on γ
     gamma::Float64
@@ -120,6 +126,12 @@ function ou_half_life(s::AbstractVector)
     (0.0 < φ < 1.0) ? -log(2.0) / log(φ) : Inf
 end
 
+"""
+    EGResult
+
+Engle-Granger result: cointegrating regression `alpha`, `beta`; residual `adf` statistic;
+MacKinnon critical values `crit` (1%, 5%, 10%); residual OU `half_life`; `resid_std`; `nobs`.
+"""
 struct EGResult
     alpha::Float64
     beta::Float64

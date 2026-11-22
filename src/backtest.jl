@@ -111,6 +111,13 @@ struct FormationRecord
     selected::Vector{NTuple{2,Int}}
 end
 
+"""
+    BacktestResult
+
+Output of [`run_backtest`](@ref): bar indices `t`, `timestamps`, `equity` and `returns`;
+columnar telemetry `bars`, `health` and `fills` (`StructVector`s, so they work with any
+Tables.jl consumer); `formations`; the final `book`; and the config used.
+"""
 struct BacktestResult
     config::BacktestConfig
     t::Vector{Int}
@@ -158,15 +165,18 @@ function _formation!(pairs, byid, next_id::Ref{Int}, panel::PricePanel, cfg::Bac
     end
     push!(formations, FormationRecord(t, length(cands), length(good), selected))
 
-    selset = Set(selected)
-    existing = Dict{NTuple{2,Int},PairState}()
+    # Pairs are identified by their asset set, not orientation: a pair re-selected as
+    # (x, y) keeps its existing live state instead of opening a second position.
+    selset = Set(minmax(p...) for p in selected)
+    existing = Set{NTuple{2,Int}}()
     for ps in pairs
-        existing[(ps.y, ps.x)] = ps
-        ps.in_universe = (ps.y, ps.x) in selset
+        key = minmax(ps.y, ps.x)
+        push!(existing, key)
+        ps.in_universe = key in selset
     end
     rng = t-F+1:t
     for (yi, xi) in selected
-        haskey(existing, (yi, xi)) && continue          # retained pair keeps its live filter
+        minmax(yi, xi) in existing && continue          # retained pair keeps its live filter
         yv = view(logp, yi, rng); xv = view(logp, xi, rng)
         kf = calibrate_kalman(yv, xv, cfg.kalman; warmup = false)
         zr = MirroredRing(1, cfg.innov_window)

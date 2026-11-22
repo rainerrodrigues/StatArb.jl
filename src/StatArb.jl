@@ -31,13 +31,18 @@ include("synthetic.jl")
 include("stress.jl")
 
 """
-    load_panel_arrow(path; ...) -> PricePanel
-    save_panel_arrow(path, panel)
+    load_panel_arrow(path; bars_per_year=252, spread_bps=5, depth_frac=0.01) -> PricePanel
 
-Memory-mapped Arrow IO for long-format bar data (`timestamp, symbol, mid, spread, volume,
-depth[, sector]`). Available after `using Arrow` (package extension).
+Memory-mapped Arrow reader for long-format bar data (`timestamp, symbol, mid` and
+optionally `spread, volume, depth, sector`). Available after `using Arrow` (package extension).
 """
 function load_panel_arrow end
+
+"""
+    save_panel_arrow(path, panel)
+
+Write a panel in the long format read by [`load_panel_arrow`](@ref). Requires `using Arrow`.
+"""
 function save_panel_arrow end
 
 # data

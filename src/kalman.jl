@@ -85,7 +85,9 @@ In-place update with the new observation; returns the innovation Z-score `e/√S
     kf.z
 end
 
+"""Current filtered hedge ratio β_t."""
 hedge_ratio(kf::KalmanHedge) = kf.θ[2]
+"""Current filtered intercept α_t."""
 intercept(kf::KalmanHedge) = kf.θ[1]
 
 """

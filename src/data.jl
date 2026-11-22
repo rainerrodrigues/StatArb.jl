@@ -65,7 +65,9 @@ function PricePanel(mid::AbstractMatrix{<:Real};
                collect(Int, sector), Float64(bars_per_year))
 end
 
+"""Number of assets (rows) in a panel."""
 nassets(p::PricePanel) = size(p.mid, 1)
+"""Number of bars (columns) in a panel."""
 ntimes(p::PricePanel) = size(p.mid, 2)
 Base.show(io::IO, p::PricePanel) =
     print(io, "PricePanel(", nassets(p), " assets × ", ntimes(p), " bars, ",
@@ -94,6 +96,11 @@ mutable struct Clock
     t::Int
 end
 
+"""
+    LookaheadError(requested, now)
+
+Thrown when code asks for bar `requested` while the simulation clock is at bar `now`.
+"""
 struct LookaheadError <: Exception
     requested::Int
     now::Int
@@ -108,25 +115,42 @@ function tick!(c::Clock, t::Integer)
     c
 end
 
+"""Throw a [`LookaheadError`](@ref) unless bar `τ` is at or before the clock."""
 @inline function assert_past(c::Clock, τ::Integer)
     τ <= c.t || throw(LookaheadError(τ, c.t))
     nothing
+end
+
+const PANEL_FIELDS = (:mid, :logmid, :spread, :volume, :depth)
+
+# Type-stable access to one of the bar matrices (`getfield` with a runtime Symbol would
+# infer as Union{Matrix, Float64, …} and accept non-matrix fields).
+function panel_field(p::PricePanel, field::Symbol)::Matrix{Float64}
+    field === :logmid && return p.logmid
+    field === :mid && return p.mid
+    field === :spread && return p.spread
+    field === :volume && return p.volume
+    field === :depth && return p.depth
+    throw(ArgumentError("field must be one of $(PANEL_FIELDS), got :$field"))
+end
+
+@inline function _history_range(c::Clock, W::Integer)
+    W >= 1 || throw(ArgumentError("W must be ≥ 1"))
+    c.t - W + 1 >= 1 || throw(ArgumentError("not enough history: t=$(c.t), W=$W"))
+    (c.t - W + 1):c.t
 end
 
 """
     history(panel, clock, W; field=:logmid)        -> n × W view
     history(panel, clock, asset, W; field=:logmid) -> length-W view
 
-Zero-copy view of the `W` bars ending at (and including) `clock.t`.
+Zero-copy view of the `W` bars ending at (and including) `clock.t`. `field` is one of
+`:mid, :logmid, :spread, :volume, :depth`.
 """
-function history(p::PricePanel, c::Clock, W::Integer; field::Symbol = :logmid)
-    c.t - W + 1 >= 1 || throw(ArgumentError("not enough history: t=$(c.t), W=$W"))
-    view(getfield(p, field), :, c.t-W+1:c.t)
-end
-function history(p::PricePanel, c::Clock, asset::Integer, W::Integer; field::Symbol = :logmid)
-    c.t - W + 1 >= 1 || throw(ArgumentError("not enough history: t=$(c.t), W=$W"))
-    view(getfield(p, field), asset, c.t-W+1:c.t)
-end
+history(p::PricePanel, c::Clock, W::Integer; field::Symbol = :logmid) =
+    view(panel_field(p, field), :, _history_range(c, W))
+history(p::PricePanel, c::Clock, asset::Integer, W::Integer; field::Symbol = :logmid) =
+    view(panel_field(p, field), asset, _history_range(c, W))
 
 # ─── Mirrored ring buffer ────────────────────────────────────────────────────
 
@@ -183,9 +207,18 @@ end
     r
 end
 
+"""`true` once at least `W` samples have been pushed (so `window` is fully populated)."""
 isfull(r::MirroredRing) = r.count >= r.W
 Base.length(r::MirroredRing) = min(r.count, r.W)
+"""Forget all samples (the storage is kept)."""
 reset!(r::MirroredRing) = (r.head = 0; r.count = 0; r)
+"""
+    window(r)    -> k × W view
+    window(r, i) -> length-W view of row i
+
+The last `W` samples in chronological order, as a contiguous zero-copy view. Only
+meaningful once [`isfull`](@ref); use [`filled_window`](@ref) before that.
+"""
 @inline window(r::MirroredRing) = view(r.buf, :, r.head+1:r.head+r.W)
 @inline window(r::MirroredRing, i::Integer) = view(r.buf, i, r.head+1:r.head+r.W)
 """Most recent `min(count, W)` samples of row `i` (valid before the buffer is full)."""
@@ -193,4 +226,8 @@ reset!(r::MirroredRing) = (r.head = 0; r.count = 0; r)
     n = length(r)
     view(r.buf, i, r.head+r.W-n+1:r.head+r.W)
 end
-@inline latest(r::MirroredRing, i::Integer = 1) = @inbounds r.buf[i, r.head]
+"""Most recent sample of row `i`."""
+@inline function latest(r::MirroredRing, i::Integer = 1)
+    r.count > 0 || throw(ArgumentError("ring buffer is empty"))
+    @inbounds r.buf[i, r.head]
+end

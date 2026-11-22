@@ -19,6 +19,7 @@ Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 StatArbArrowExt = "Arrow"
 
 [compat]
+Aqua = "0.8"
 Arrow = "2"
 Dates = "1"
 LinearAlgebra = "1"
@@ -27,11 +28,13 @@ Random = "1"
 StaticArrays = "1.9"
 Statistics = "1"
 StructArrays = "0.6, 0.7"
+Test = "1"
 julia = "1.10"
 
 [extras]
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Arrow", "Test"]
+test = ["Aqua", "Arrow", "Test"]
