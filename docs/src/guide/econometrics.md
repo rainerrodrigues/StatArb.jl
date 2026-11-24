@@ -52,6 +52,25 @@ matrices are ever formed.
 A price spread has a mean but no trend, so `:restricted` is the right null for pairs. On
 drift-free random walks the unrestricted tables reject 12–31% of the time at a nominal 5%.
 
+## Exact p-values
+
+Critical-value tables only give a reject/accept answer at fixed levels. For p-values,
+StatArb simulates the null distribution of exactly the statistic you computed (same series
+length, lag order and deterministic terms), once per configuration with a fixed seed, and
+caches it:
+
+| Function | Statistic |
+|---|---|
+| [`adf_pvalue`](@ref) | ADF t-statistic ([`adf!`](@ref)), with or without a constant |
+| [`eg_pvalue`](@ref) | one-orientation Engle-Granger statistic |
+| [`eg_null_distribution`](@ref) | the two-orientation minimum that formation uses |
+| [`johansen_pvalue`](@ref) | rank-0 trace statistic, `k` assets, restricted constant |
+
+The p-values are `(#{draws at least as extreme} + 1) / (n + 1)`, which is valid for any
+number of draws. The simulated 5% point of the Engle-Granger statistic matches MacKinnon's
+response surface, and the CI validation job checks that ADF p-values on random walks fall
+below 0.05 about 5% of the time.
+
 ## Half-life
 
 [`ou_half_life`](@ref) fits `Δs_t = a + b s_{t−1}` and returns
@@ -101,6 +120,18 @@ On the same noise universe, this selects 0.04 pairs per formation. Set
     *nominal* guarantee doesn't strictly hold. The CI validation job measures what actually
     happens on pure noise and fails the build if the false-selection rate rises above
     0.15 pairs per formation.
+
+### Baskets
+
+Basket candidates come from [`basket_candidates`](@ref) and are tested with a `k`-asset
+Johansen test. They get their own Benjamini-Hochberg family, using
+[`johansen_null_distribution`](@ref) with `k = basket_size`. Two extra rules apply:
+- the half-life of the Johansen spread must be within bounds;
+- no leg's weight may fall below `min_basket_weight × max|w|`, which rules out a pair plus
+  an irrelevant asset.
+
+On universes with planted baskets, about 90% of basket selections are planted baskets (CI
+validation job).
 
 ## Pre-screening
 

@@ -14,9 +14,11 @@ pre-allocated workspaces with **zero heap allocations**, and JET reports no runt
 ```julia
 using StatArb, Random
 panel, truth = synthetic_universe(Xoshiro(1); n_pairs = 10, n_noise = 10, T = 2000)
-res = run_backtest(panel, BacktestConfig())
+res = run_backtest(panel, BacktestConfig(max_baskets = 3))   # pairs + 3-asset baskets
 report(res)                                   # performance + execution + model health
 sw  = sensitivity_sweep(panel)                # Q / R / window / half-life misspecification
+export_results("out", res)                    # CSV logs (or format = :arrow after `using Arrow`)
+# using CairoMakie; plot_backtest(res)        # dashboard via the Makie extension
 ```
 
 Run with threads for parallel formation scans and sweeps: `julia --project=. -t auto`.
@@ -31,6 +33,7 @@ each layer, and the full API.
 | `ci.yml` → `test` | the full test suite (Aqua included) on Julia 1.10, 1.11 and latest on Linux, plus latest on macOS and Windows; coverage goes to Codecov |
 | `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery, false selections on pure noise, p-value calibration, Kalman innovation whiteness and spread tracking, and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
 | `ci.yml` → `benchmark` | hot-loop latency, allocation counts and backtest throughput, posted to the job summary |
+| `ci.yml` → `plotting` | renders every plot of the Makie extension with CairoMakie |
 | `ci.yml` → `jet` | JET static analysis of the whole package (pinned to Julia 1.12) |
 | `docs.yml` | builds the Documenter site, running every example, and deploys it to `gh-pages` |
 | `TagBot.yml`, `CompatHelper.yml` | release tagging and dependency compat bumps |
@@ -48,12 +51,15 @@ each layer, and the full API.
 | `src/screening.jl` | distance pre-screen, threaded pair/basket scans, health-gate state machine |
 | `src/selection.jl` | exact null distributions, Monte Carlo p-values, Benjamini-Hochberg FDR control |
 | `src/validate.jl` | configuration validation |
-| `src/portfolio.jl` | pair caps, hedge-ratio leg split, cross-spread mean-variance overlay |
-| `src/backtest.jl` | walk-forward event loop |
+| `src/portfolio.jl` | caps, cross-spread mean-variance overlay |
+| `src/strategy.jl`, `src/rules.jl` | pluggable signal rules (`ZScoreBands`, `CostAwareBands`) and allocators |
+| `src/backtest.jl` | walk-forward event loop over pairs and baskets, in stages |
 | `src/metrics.jl` | Sharpe/Sortino/MDD/Calmar, factor attribution, health telemetry, text dashboard |
 | `src/synthetic.jl` | OU pairs, VECM simulator, synthetic universes, parameter-recovery study |
 | `src/stress.jl` | parameter-misspecification sweeps |
+| `src/export.jl` | CSV / Arrow export of results; plotting API |
 | `ext/StatArbArrowExt.jl` | memory-mapped Arrow IO (`using Arrow` activates it) |
+| `ext/StatArbMakieExt.jl` | `plot_backtest`, `plot_health`, `plot_sweep` (any Makie backend activates it) |
 
 ## Design notes
 
@@ -130,6 +136,24 @@ cached per window length, and both tests must reject.
 - **Margin:** a breach of `maintenance_margin` triggers a forced liquidation and an entry cooldown.
 - **Config checks:** `validate_config` reports every inconsistent setting at once.
 
+**Baskets.** With `max_baskets > 0`, formation grows screened pairs into 3–5 asset baskets,
+tests them with Johansen (exact p-values, FDR control), and rejects "pairs in disguise"
+(a leg with negligible weight). Baskets trade with fixed Johansen weights and a two-state
+spread filter. On synthetic universes with planted baskets, about 90% of basket
+selections are planted ones, and adding baskets raised Sharpe in all 6 test seeds (mean
+1.78 → 2.30).
+
+**Pluggable strategy.** `run_backtest` is a sequence of stages, and the signal rule and
+allocator are config fields (`signal_rule`, `allocator`). Subtype `AbstractSignalRule` or
+`AbstractAllocator` and implement one method to plug in your own; the backtester
+specialises on the concrete types. `CostAwareBands` only enters when the expected
+reversion pays for the estimated round trip. It never binds when costs are small; with
+30 bps spreads on low-volatility spreads, it turned a −1.6% excess return into +0.1%
+while trading 93% less.
+
+**Exact p-values.** `adf_pvalue`, `eg_pvalue` and `johansen_pvalue` give finite-sample
+Monte Carlo p-values for the statistics as computed, cached per configuration.
+
 **Health gate.** A pair is moved to *quarantine* (close-only) when the rolling Johansen rank drops to 0
 (`gate_on = :eg` or `:either` are also available) or when its half-life leaves `hl_bounds`. It
 recovers after `recover_checks` consecutive passing checks.
@@ -144,6 +168,7 @@ raw Sharpe of 10.9 drops to 2.9).
 |---|---|---|
 | Kalman update, OU model (3 states) | ~71 ns | 0 |
 | Kalman update, random-walk model (2 states) | ~29 ns | 0 |
+| Basket spread filter update | ~47 ns | 0 |
 | Ring push + window view | ~3 ns | 0 |
 | Engle-Granger, W=250 | ~2.2 µs | 0 |
 | Johansen k=2, W=250 | ~10 µs | 0 |
@@ -160,6 +185,8 @@ raw Sharpe of 10.9 drops to 2.9).
 - **Misspecification:** overestimating reversion speed 4× costs 0.75 Sharpe; underestimating it 4×
   costs nothing (−0.01). Short health windows (W = 60/120) don't have the power to keep pairs out of
   quarantine, so Sharpe drops to 0.43 and 1.83.
+- **API change:** `with(cfg; …)` is now `reconfigure(cfg; …)` (`with` still works, with a
+  deprecation warning).
 - **Pair selection:** with false-discovery control, a universe of pure random walks yields 0.02
   spurious pairs per formation, against 2.6 with plain per-test selection (see the CI validation job).
 - **Kalman model:** with the default OU-augmented filter, the innovation ACF(1) is 0.04, so the
@@ -171,8 +198,10 @@ raw Sharpe of 10.9 drops to 2.9).
 
 - No Fama-French data is bundled. `factor_attribution` accepts any user-supplied factor matrix, and
   `panel_factors` computes market and short-term-reversal factors from the panel itself.
-- ADF and Engle-Granger give MacKinnon critical values, not p-values. The Johansen tables cover up to
-  5 assets with a restricted constant and 6 with an unrestricted one.
+- Johansen critical-value tables cover up to 5 assets with a restricted constant and 6 with an
+  unrestricted one. Exact p-values work for any supported `k`, but cost about 0.1 s to simulate once
+  per window length.
+- Basket weights are fixed between formations; only pairs have a time-varying hedge ratio.
 - Bars only. There's no tick-level order-book replay; liquidity checks use bar volume and top-of-book
   depth.
 - `LoopVectorization.jl` isn't used: the kernels are small hand-written `@simd` loops.

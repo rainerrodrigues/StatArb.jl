@@ -14,13 +14,16 @@ StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
 
 [weakdeps]
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 
 [extensions]
 StatArbArrowExt = "Arrow"
+StatArbMakieExt = "Makie"
 
 [compat]
 Aqua = "0.8"
 Arrow = "2"
+Makie = "0.21, 0.22, 0.23, 0.24"
 Dates = "1"
 LinearAlgebra = "1"
 Printf = "1"

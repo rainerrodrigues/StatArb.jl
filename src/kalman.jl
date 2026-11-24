@@ -371,6 +371,134 @@ function calibrate_ou_kalman(y::AbstractVector, x::AbstractVector, cfg::KalmanCo
     kf
 end
 
+# ─── basket spread filter ────────────────────────────────────────────────────
+
+"""
+    BasketFilter
+
+Two-state filter for the value `v_t = w'·log p_t` of a basket spread with fixed weights
+(from the Johansen cointegrating vector):
+
+    v_t = μ_t + s_t + ϵ_t,   μ_t = μ_{t-1} + ω_t,   s_t = φ s_{t-1} + η_t
+
+`μ` is a slowly drifting equilibrium level and `s` the mean-reverting deviation. The
+trading signal is `z = ŝ_{t|t} / σ_s`. Calibration and recalibration use the same
+moment-based noise fit as the pair OU model ([`ou_noise_fit`](@ref)). Zero allocations.
+"""
+mutable struct BasketFilter
+    θ::SV2           # (μ, s)
+    P::SM22
+    φ::Float64
+    Q::SM22          # diag(q_μ, σ²_η)
+    R::Float64
+    σs::Float64
+    e::Float64
+    S::Float64
+    z::Float64
+    innov_z::Float64
+    P_ref::Float64   # reference Var(s) for throttling
+    n::Int
+end
+
+"""
+    basket_kalman_step(θ, P, φ, Q, R, v) -> (θ⁺, P⁺, e, S)
+
+Predict/update for [`BasketFilter`](@ref) (Joseph form).
+"""
+@inline function basket_kalman_step(θ::SV2, P::SM22, φ::Float64, Q::SM22, R::Float64, v::Float64)
+    A = SM22(1.0, 0.0, 0.0, φ)
+    θp = A * θ
+    Pp = A * P * A' + Q
+    H = SV2(1.0, 1.0)
+    e = v - dot(H, θp)
+    PH = Pp * H
+    S = dot(H, PH) + R
+    K = PH / S
+    IKH = SM22(I) - K * H'
+    Pn = IKH * Pp * IKH' + (K * K') * R
+    return θp + K * e, Pn, e, S
+end
+
+"""
+    kalman_update!(kf::BasketFilter, v) -> z
+
+Update a basket filter with the new spread value `v = w'·log p_t`.
+"""
+@inline function kalman_update!(kf::BasketFilter, v::Float64)
+    θ, P, e, S = basket_kalman_step(kf.θ, kf.P, kf.φ, kf.Q, kf.R, v)
+    kf.θ = θ
+    kf.P = P
+    kf.e = e
+    kf.S = S
+    kf.innov_z = e / sqrt(S)
+    kf.z = θ[2] / kf.σs
+    kf.n += 1
+    kf.z
+end
+
+innovation_z(kf::BasketFilter) = kf.innov_z
+# a basket's weights are fixed Johansen weights: there is no single filtered hedge ratio
+hedge_ratio(::BasketFilter) = NaN
+filtered_spread(kf::BasketFilter) = kf.θ[2]
+model_half_life(kf::BasketFilter) = 0 < kf.φ < 1 ? -log(2.0) / log(kf.φ) : Inf
+@inline size_multiplier(kf::BasketFilter; floor::Float64 = 0.0) = clamp(kf.P_ref / kf.P[2, 2], floor, 1.0)
+
+function _set_basket_dynamics!(kf::BasketFilter, φ::Float64, ση2::Float64, Rhat::Float64, cfg::KalmanConfig)
+    (isfinite(φ) && isfinite(ση2) && ση2 > 0) || return kf
+    φc = clamp(φ, 0.0, _PHI_MAX)
+    σs2 = ση2 / (1 - φc^2)
+    q = cfg.q_scale * cfg.delta / (1 - cfg.delta) * σs2
+    kf.φ = φc
+    kf.σs = sqrt(σs2)
+    kf.Q = SM22(q, 0.0, 0.0, ση2)
+    Rb = cfg.obs_noise_frac === nothing ? (isfinite(Rhat) ? Rhat : _R_FLOOR * σs2) : cfg.obs_noise_frac * σs2
+    kf.R = cfg.r_scale * max(Rb, _R_FLOOR * σs2)
+    kf
+end
+
+function recalibrate!(kf::BasketFilter, s::AbstractVector, cfg::KalmanConfig, ::Real = 0.0)
+    φ, ση2, R = ou_noise_fit(s)
+    _set_basket_dynamics!(kf, φ, ση2, R, cfg)
+end
+
+"""
+    calibrate_basket_filter(v, cfg; warmup=true) -> BasketFilter
+
+Calibrate a [`BasketFilter`](@ref) on a formation-window spread series `v`.
+"""
+function calibrate_basket_filter(v::AbstractVector, cfg::KalmanConfig; warmup::Bool = true)
+    n = length(v)
+    μ = sum(v) / n
+    d = [v[t] - μ for t in 1:n]
+    φ, ση2, Rhat = ou_noise_fit(d)
+    if !(isfinite(φ) && isfinite(ση2) && ση2 > 0)
+        φ, ση2, Rhat = 0.9, max(sum(abs2, d) / n * 0.19, 1e-12), NaN
+    end
+    φc = clamp(φ, 0.0, _PHI_MAX)
+    σs2 = ση2 / (1 - φc^2)
+    kf = BasketFilter(SV2(μ, d[1]), SM22(σs2, 0.0, 0.0, σs2), φc, zero(SM22), 0.0, sqrt(σs2),
+                      0.0, 0.0, 0.0, 0.0, 0.0, 0)
+    _set_basket_dynamics!(kf, φ, ση2, Rhat, cfg)
+    if warmup
+        @inbounds for t in 1:n
+            kalman_update!(kf, Float64(v[t]))
+        end
+    end
+    kf.P_ref = kf.P[2, 2]
+    kf
+end
+
+"""
+    spread_scale(model) -> Float64
+
+Standard deviation of the traded spread, in log-price units, implied by the filter: `σ_s`
+for the OU and basket models, `√S` (the innovation standard deviation) for the
+random-walk model. Converts a Z-score into an expected price move (cost-aware entries).
+"""
+spread_scale(kf::OUKalmanHedge) = kf.σs
+spread_scale(kf::BasketFilter) = kf.σs
+spread_scale(kf::KalmanHedge) = sqrt(kf.S)
+
 """
     calibrate_filter(y, x, cfg; warmup=true)
 

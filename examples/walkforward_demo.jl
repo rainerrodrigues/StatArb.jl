@@ -22,7 +22,7 @@ F, names = panel_factors(panel, res.t[2:end])
 println("\n=== Aggressive (market-order) execution ===")
 report(res; factors = F, factor_names = names)
 
-resp = run_backtest(panel, with(cfg; exec = ExecConfig(style = :passive)))
+resp = run_backtest(panel, reconfigure(cfg; exec = ExecConfig(style = :passive)))
 println("\n=== Passive limit execution (with legging risk) ===")
 report(resp)
 

@@ -116,6 +116,19 @@ lower (1.90 vs 2.10 with 0.3% noise). Part of the random-walk model's return in 
 simulations comes from trading the quote noise itself, which reverts in the very next mid.
 Real bid-ask bounce is far harder to capture, so that profit is optimistic.
 
+## Baskets
+
+Baskets of 3–5 assets use fixed Johansen weights `w`, so there's no hedge ratio to filter.
+[`BasketFilter`](@ref) tracks the scalar spread `v_t = w'·log p_t` as a slowly drifting
+level plus an AR(1) deviation:
+
+```math
+v_t = \mu_t + s_t + \epsilon_t,\qquad \mu_t = \mu_{t-1} + \omega_t,\qquad s_t = \phi\, s_{t-1} + \eta_t
+```
+
+It uses the same moment-based calibration and recalibration as the pair OU model, and
+trades on ``\hat s_{t\mid t}/\sigma_s``. An update takes ~47 ns with zero allocations.
+
 ## Reading the telemetry
 
 The dashboard reports the lag-1 autocorrelation of the standardised innovations

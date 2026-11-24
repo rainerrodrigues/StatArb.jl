@@ -86,6 +86,27 @@ function kalman_spec(seed, nsim)
     mean(acf_ou), mean(acf_rw), mean(trk), median(hl)
 end
 
+# Basket selection on universes with planted three-asset baskets
+function basket_precision(seeds)
+    hits = 0; tot = 0
+    for s in seeds
+        panel, truth = synthetic_universe(Xoshiro(s); n_pairs = 4, n_baskets = 4, n_noise = 8, T = 1500)
+        planted = Set(sort(tr.assets) for tr in truth if length(tr.assets) == 3)
+        res = run_backtest(panel, BacktestConfig(max_baskets = 4, threaded_formation = false))
+        for f in res.formations, b in f.baskets
+            tot += 1; hits += b in planted
+        end
+    end
+    hits / max(tot, 1), tot
+end
+
+# ADF Monte Carlo p-values under the null
+function adf_calibration(seed, n)
+    rng = Xoshiro(seed)
+    ws = OLSWorkspace(250, 3)
+    mean(adf_pvalue(adf!(ws, cumsum(randn(rng, 250)), 1)) < 0.05 for _ in 1:n)
+end
+
 t0 = time()
 eg, j2, j3 = size_study(11, 4000, 250)
 check("Engle-Granger size (5% test, T=250)", fmt(eg), "0.035 – 0.065", 0.035 <= eg <= 0.065)
@@ -113,6 +134,11 @@ check("Kalman RW model: innovation ACF(1) on OU pairs + quote noise", fmt(kr), "
 check("Kalman OU model: innovation ACF(1) on OU pairs + quote noise", fmt(ka), "abs < 0.10", abs(ka) < 0.10)
 check("Kalman OU model: corr(filtered spread, true spread)", fmt(kt), "≥ 0.90", kt >= 0.90)
 check("Kalman OU model: implied half-life median (true 8)", fmt(kh), "6.0 – 10.0", 6.0 <= kh <= 10.0)
+
+bp, bn = basket_precision(51:56)
+check("baskets: share of selections that are planted baskets ($bn selections)", fmt(bp), "≥ 0.85", bp >= 0.85)
+ac = adf_calibration(16, 2000)
+check("ADF Monte Carlo p-values on random walks: P(p < 0.05)", fmt(ac), "0.035 – 0.065", 0.035 <= ac <= 0.065)
 
 rr = vecm_rank_recovery(13, 300)
 check("VECM rank recovery (true r=2)", fmt(rr), "≥ 0.90", rr >= 0.90)

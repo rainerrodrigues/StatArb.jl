@@ -21,6 +21,7 @@ eg = EGWorkspace(W, 4)
 jw2 = JohansenWorkspace(2, W); jw3 = JohansenWorkspace(3, W)
 kf = calibrate_kalman(sim.y, sim.x, KalmanConfig(model = :rw))
 kou = calibrate_ou_kalman(sim.y, sim.x, KalmanConfig())
+kb = calibrate_basket_filter(sim.y .- 1.2 .* sim.x, KalmanConfig())
 ring = MirroredRing(2, W)
 for t in 1:W; push!(ring, view(X, :, t)); end
 y0, x0 = 4.1, 3.9
@@ -28,6 +29,7 @@ y0, x0 = 4.1, 3.9
 rows = [
     ("Kalman update (2-state RW)", () -> kalman_update!(kf, y0, x0), 10^7),
     ("Kalman update (3-state OU)", () -> kalman_update!(kou, y0, x0), 10^7),
+    ("Basket spread filter update", () -> kalman_update!(kb, 0.01), 10^7),
     ("Ring push + window view", () -> (push!(ring, (4.0, 3.9)); window(ring)), 10^7),
     ("Engle-Granger (W=250)", () -> engle_granger!(eg, sim.y, sim.x), 10^5),
     ("Johansen k=2 (W=250)", () -> johansen!(jw2, X), 10^5),

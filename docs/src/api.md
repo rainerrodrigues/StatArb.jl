@@ -56,6 +56,13 @@ Modules = [StatArb]
 Pages = ["selection.jl"]
 ```
 
+## Strategy components
+
+```@autodocs
+Modules = [StatArb]
+Pages = ["strategy.jl", "rules.jl"]
+```
+
 ## Portfolio
 
 ```@autodocs
@@ -96,6 +103,13 @@ Pages = ["synthetic.jl"]
 ```@autodocs
 Modules = [StatArb]
 Pages = ["stress.jl"]
+```
+
+## Export and plotting
+
+```@autodocs
+Modules = [StatArb]
+Pages = ["export.jl"]
 ```
 
 ## Arrow IO

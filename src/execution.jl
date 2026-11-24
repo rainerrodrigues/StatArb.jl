@@ -32,6 +32,10 @@ Execution and financing assumptions.
 - `latency` bars between decision and earliest fill (must be ≥ 1)
 - `style`: `:market` (both legs aggressive) or `:passive` (both legs post at the touch)
 - `limit_wait`: bars a passive order rests before crossing
+- `reprice`: re-peg resting passive orders to the latest touch every bar (otherwise they
+  keep the decision-bar price for their whole life). Only matters with `limit_wait > 1`; on
+  daily synthetic bars, longer resting with re-pegging produced *more* legging and a lower
+  Sharpe than crossing after one bar.
 - `max_participation`: max fraction of bar volume per fill; `depth_levels`: max multiple of
   displayed touch size that may be consumed per bar
 - `impact_coef` η of the square-root law `Δp/p = η σ_bar √(q/V)`
@@ -45,6 +49,7 @@ Base.@kwdef struct ExecConfig
     latency::Int = 1
     style::Symbol = :market
     limit_wait::Int = 1
+    reprice::Bool = false
     max_participation::Float64 = 0.10
     depth_levels::Float64 = 5.0
     impact_coef::Float64 = 0.5
@@ -152,13 +157,25 @@ end
 Submit a (one- or two-legged) ticket decided at bar `t`. `assets`/`qtys` are tuples of
 (y, x) asset indices and signed share quantities; zero quantities are skipped.
 """
-function submit_pair!(sim::ExecutionSimulator, p::PricePanel, pair::Int,
-                      assets::NTuple{2,Int}, qtys::NTuple{2,Float64}, t::Int)
+submit_pair!(sim::ExecutionSimulator, p::PricePanel, pair::Int,
+             assets::NTuple{2,Int}, qtys::NTuple{2,Float64}, t::Int) =
+    submit_ticket!(sim, p, pair, assets, qtys, t)
+
+"""
+    submit_ticket!(sim, panel, spread_id, assets, qtys, t) -> ticket
+
+Submit a multi-leg ticket decided at bar `t`: leg `i` trades `qtys[i]` signed shares of
+`assets[i]` (zero quantities are skipped). All legs share one ticket, so a passive fill
+on any leg crosses the remaining resting legs (legging risk).
+"""
+function submit_ticket!(sim::ExecutionSimulator, p::PricePanel, pair::Int,
+                        assets, qtys, t::Int)
+    length(assets) == length(qtys) || throw(DimensionMismatch("assets and qtys"))
     cfg = sim.cfg
     ticket = sim.next_ticket
     sim.next_ticket += 1
-    for leg in 1:2
-        q = qtys[leg]
+    for leg in eachindex(assets)
+        q = Float64(qtys[leg])
         q == 0.0 && continue
         a = assets[leg]
         m = p.mid[a, t]
@@ -175,8 +192,9 @@ function submit_pair!(sim::ExecutionSimulator, p::PricePanel, pair::Int,
     ticket
 end
 
-@inline _with(o::Order; qty = o.qty, kind = o.kind, active_t = o.active_t, legged = o.legged) =
-    Order(o.ticket, o.pair, o.leg, o.asset, qty, kind, o.limit, o.decision_mid, o.submit_t,
+@inline _with(o::Order; qty = o.qty, kind = o.kind, active_t = o.active_t, legged = o.legged,
+               limit = o.limit) =
+    Order(o.ticket, o.pair, o.leg, o.asset, qty, kind, limit, o.decision_mid, o.submit_t,
           active_t, o.expire_t, legged)
 
 """
@@ -234,6 +252,9 @@ function process_orders!(on_fill::F, sim::ExecutionSimulator, book::Book, p::Pri
             end
         elseif o.kind == LIMIT && t >= o.expire_t
             pend[i] = _with(o; kind = MARKET, active_t = t + cfg.latency)
+        elseif o.kind == LIMIT && cfg.reprice
+            # re-peg to this bar's touch (known now) for the next bar
+            pend[i] = _with(o; limit = sgn > 0 ? m - h : m + h)
         end
         i += 1
     end

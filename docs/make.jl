@@ -15,6 +15,8 @@ makedocs(
         "Tutorials" => [
             "tutorials/getting_started.md",
             "tutorials/validation.md",
+            "tutorials/baskets_and_rules.md",
+            "tutorials/plotting.md",
         ],
         "Guides" => [
             "guide/architecture.md",

@@ -22,22 +22,22 @@ function sensitivity_sweep(panel::PricePanel, base::BacktestConfig = BacktestCon
                            q_scales = (0.1, 1.0, 10.0, 100.0), r_scales = (0.25, 1.0, 4.0),
                            windows = (60, 120, 250), hl_scales = (0.25, 0.5, 1.0, 2.0, 4.0),
                            threaded::Bool = true)
-    base = with(base; threaded_formation = false)
+    base = reconfigure(base; threaded_formation = false)
     specs = Tuple{Symbol,Float64,BacktestConfig}[]
     for q in q_scales
-        push!(specs, (:q_scale, q, with(base; kalman = with(base.kalman; q_scale = q))))
+        push!(specs, (:q_scale, q, reconfigure(base; kalman = reconfigure(base.kalman; q_scale = q))))
     end
     for r in r_scales
-        push!(specs, (:r_scale, r, with(base; kalman = with(base.kalman; r_scale = r))))
+        push!(specs, (:r_scale, r, reconfigure(base; kalman = reconfigure(base.kalman; r_scale = r))))
     end
     for w in windows
         w <= base.formation || continue
         lo, hi = base.hl_bounds
         hb = (lo, min(hi, w / 2 - 1))
-        push!(specs, (:health_window, w, with(base; health_window = w, hl_bounds = hb)))
+        push!(specs, (:health_window, w, reconfigure(base; health_window = w, hl_bounds = hb)))
     end
     for h in hl_scales
-        push!(specs, (:hl_scale, h, with(base; hl_scale = h)))
+        push!(specs, (:hl_scale, h, reconfigure(base; hl_scale = h)))
     end
     out = Vector{Any}(undef, length(specs))
     foreach_chunk(length(specs); threaded = threaded) do chunk

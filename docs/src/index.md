@@ -23,6 +23,9 @@ report(res)                       # performance + execution costs + model health
 - [Getting started](@ref) walks through a full backtest on synthetic data.
 - [Validating the engine](@ref) checks parameter recovery and stress-tests the strategy
   before you use real data.
+- [Baskets and custom rules](@ref) covers trading 3–5 asset baskets, cost-aware entries,
+  and writing your own signal rule or allocator.
+- [Plotting and exporting results](@ref) shows the Makie dashboard and CSV/Arrow export.
 - The guides explain each layer: [Architecture and temporal guardrails](@ref),
   [Cointegration diagnostics](@ref), [Kalman hedge ratios](@ref),
   [Execution model](@ref) and [Performance](@ref).

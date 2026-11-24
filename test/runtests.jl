@@ -3,6 +3,12 @@ using StatArb
 using StatArb: chol!, cholsolve!, _book_fill!, Order
 using Test, Random, LinearAlgebra, Statistics, Dates, StaticArrays
 
+# user-defined strategy components for the plug-in tests
+struct NeverTrade <: AbstractSignalRule end
+StatArb.update_signal!(::NeverTrade, sp::SpreadState, ctx::SignalContext) = (sp.signal = 0)
+struct HalfWeights <: AbstractAllocator end
+StatArb.target_weights!(::HalfWeights, w, sel, ctx) = (w .= 0.5 .* [sp.signal for sp in sel])
+
 # Independent (allocating, textbook) Johansen with restricted constant, used as a reference.
 function naive_johansen(X::AbstractMatrix, kdiff::Int)
     k, W = size(X)
@@ -358,7 +364,7 @@ end
     # fills never happen before decision + latency
     @test all(res.fills.t .>= res.fills.submit_t .+ cfg.exec.latency)
     # the OU filter (default) leaves near-white innovations; the random-walk model does not
-    rrw = run_backtest(panel, with(cfg; kalman = KalmanConfig(model = :rw)))
+    rrw = run_backtest(panel, reconfigure(cfg; kalman = KalmanConfig(model = :rw)))
     @test health_telemetry(res).innov_acf1 < 0.2
     @test health_telemetry(rrw).innov_acf1 > 0.4
     @test all(isfinite, res.health.kf_half_life)
@@ -369,7 +375,7 @@ end
     end
     @test allunique(minmax(h.y, h.x) => h.t for h in res.health)
     # passive style runs and records passive / legged fills
-    resp = run_backtest(panel, with(cfg; exec = ExecConfig(style = :passive)))
+    resp = run_backtest(panel, reconfigure(cfg; exec = ExecConfig(style = :passive)))
     @test resp.book.n_passive > 0
 
     # ── lookahead test: scrambling the future must not change the past ──
@@ -546,6 +552,153 @@ end
     @test occursin("Margin calls", sprint(io -> report(io, r1)))
 end
 
+@testset "pluggable strategy components" begin
+    panel, _ = synthetic_universe(Xoshiro(81); T = 1000)
+    base = BacktestConfig(risk = RiskConfig(correlation_overlay = false))
+    r0 = run_backtest(panel, base)
+    @test r0.book.n_fills > 0
+    # a custom rule that never trades
+    @test run_backtest(panel, reconfigure(base; signal_rule = NeverTrade())).book.n_fills == 0
+    # EqualWeightAllocator is what DefaultAllocator does without the overlay
+    @test run_backtest(panel, reconfigure(base; allocator = EqualWeightAllocator())).equity == r0.equity
+    # a custom allocator halving every weight halves gross exposure (up to rounding and drift)
+    rh = run_backtest(panel, reconfigure(base; allocator = HalfWeights()))
+    k = findfirst(>(0), r0.bars.gross)
+    @test rh.bars.gross[k] ≈ 0.5 * r0.bars.gross[k] rtol = 0.02
+    # reconfigure checks field names; `with` still works but is deprecated
+    @test_throws ArgumentError reconfigure(base; z_entri = 3.0)
+    @test (@test_deprecated with(base; z_entry = 2.5)).z_entry == 2.5
+    @test reconfigure(ExecConfig(); latency = 2).latency == 2
+end
+
+@testset "basket trading" begin
+    panel, truth = synthetic_universe(Xoshiro(5); n_pairs = 4, n_baskets = 4, n_noise = 8, T = 1500)
+    bt = filter(tr -> length(tr.assets) == 3, truth)
+    @test length(bt) == 4 && all(tr -> isnan(tr.beta) && length(tr.weights) == 3, bt)
+    planted = Set(sort(tr.assets) for tr in bt)
+    # candidate generation grows screened pairs into baskets
+    cands = distance_screen(panel.logmid, 600, 252; top = 100, sector = panel.sector)
+    bc = basket_candidates(panel.logmid, cands, 600, 252, 3; sector = panel.sector)
+    @test all(length(b) == 3 && issorted(b) for b in bc)
+    @test count(in(planted), bc) == 4
+    res = run_backtest(panel, BacktestConfig(max_baskets = 4))
+    sel = [b for f in res.formations for b in f.baskets]
+    @test length(sel) >= 10
+    @test count(in(planted), sel) / length(sel) >= 0.8
+    @test any(f -> f.leg == 3, res.fills)                       # the third leg trades
+    hb = filter(h -> h.k == 3, res.health)
+    @test length(hb) > 0 && all(isnan, hb.eg_adf) && all(isfinite, hb.kf_half_life)
+    @test abs(mean(filter(isfinite, hb.innov_acf1))) < 0.15
+    @test performance(res).sharpe > performance(run_backtest(panel)).sharpe   # baskets add signal here
+    @test occursin("Baskets selected", sprint(io -> report(io, res)))
+    # three-leg passive ticket: the first passive fill crosses both other legs
+    T = 6
+    mid = fill(100.0, 3, T); mid[1, 3] = 99.0
+    p3 = PricePanel(mid; spread = fill(0.1, 3, T), volume = fill(1e5, 3, T), depth = fill(1e3, 3, T))
+    sim = ExecutionSimulator(ExecConfig(style = :passive, limit_wait = 3), 3); book = Book(1e6, 3)
+    submit_ticket!(sim, p3, 1, [1, 2, 3], [100.0, -50.0, -50.0], 2)
+    process_orders!((a...) -> nothing, sim, book, p3, 3)
+    @test book.pos[1] == 100 && count(o -> o.kind == MARKET && o.legged, sim.pending) == 2
+    process_orders!((a...) -> nothing, sim, book, p3, 4)
+    @test book.pos == [100.0, -50.0, -50.0]
+    @test_throws ArgumentError validate_config(BacktestConfig(max_baskets = 1, basket_size = 6))
+    @test_throws ArgumentError validate_config(BacktestConfig(max_pairs = 0, max_baskets = 0))
+end
+
+@testset "basket spread filter" begin
+    rng = Xoshiro(82)
+    φ = 2^(-1 / 6); s = zeros(3000)
+    for t in 2:3000
+        s[t] = φ * s[t-1] + 0.01 * randn(rng)
+    end
+    v = 0.3 .+ cumsum(1e-4 .* randn(rng, 3000)) .+ s .+ 0.003 .* randn(rng, 3000)
+    kf = calibrate_basket_filter(view(v, 1:300), KalmanConfig(); warmup = false)
+    z = Float64[]; iz = Float64[]; sh = Float64[]
+    for t in 1:3000
+        push!(z, kalman_update!(kf, v[t])); push!(iz, innovation_z(kf)); push!(sh, filtered_spread(kf))
+    end
+    r = 400:3000
+    @test abs(autocor_lag(iz[r], 1)) < 0.1
+    @test cor(sh[r], s[r]) > 0.9
+    @test 4 < model_half_life(kf) < 9
+    @test spread_scale(kf) ≈ kf.σs
+    θ, P, e, S = basket_kalman_step(kf.θ, kf.P, kf.φ, kf.Q, kf.R, 0.31)
+    @test S > kf.R && isfinite(e)
+    b(kf, x) = @allocated kalman_update!(kf, x)
+    b(kf, 0.3)
+    @test b(kf, 0.3) == 0
+end
+
+@testset "cost-aware entries" begin
+    # cheap to trade: the cost hurdle never binds, so nothing changes
+    panel, _ = synthetic_universe(Xoshiro(83); T = 1000)
+    r0 = run_backtest(panel)
+    @test run_backtest(panel, BacktestConfig(signal_rule = CostAwareBands(cost_multiple = 1.0))).equity == r0.equity
+    # expensive relative to the spread's volatility: the hurdle filters losing trades
+    hp, _ = synthetic_universe(Xoshiro(84); n_pairs = 10, n_noise = 10, T = 1500, sigma_s = 0.0015, spread_bps = 30.0)
+    rz = run_backtest(hp)
+    rc = run_backtest(hp, BacktestConfig(signal_rule = CostAwareBands(cost_multiple = 1.0)))
+    @test rc.book.n_fills < 0.3 * rz.book.n_fills
+    @test last(rc.equity) > last(rz.equity)
+    @test_throws ArgumentError validate_config(BacktestConfig(signal_rule = CostAwareBands(cost_multiple = -1.0)))
+end
+
+@testset "Monte Carlo p-values" begin
+    rng = Xoshiro(85)
+    ows = OLSWorkspace(300, 4)
+    ps = [adf_pvalue(adf!(ows, cumsum(randn(rng, 300)), 1); nsim = 4000) for _ in 1:400]
+    @test 0.02 < mean(ps .< 0.05) < 0.09                       # valid under the null
+    @test 0.4 < mean(ps) < 0.6
+    @test adf_pvalue(adf!(ows, randn(rng, 300), 1)) < 0.001
+    @test adf_pvalue(adf!(ows, cumsum(randn(rng, 300)), 1; constant = false); constant = false) > 0.0
+    ws = EGWorkspace(300, 4)
+    r = engle_granger!(ws, cumsum(randn(rng, 300)), cumsum(randn(rng, 300)))
+    nd = eg_null_distribution_single(300; nsim = 10_000)
+    @test nd.stats[500] ≈ mackinnon_crit(2, 300)[2] atol = 0.1     # simulated 5% point ≈ MacKinnon
+    @test 0 < eg_pvalue(r) <= 1
+    sim = simulate_ou_pair(rng, 300; half_life = 5.0)
+    @test eg_pvalue(engle_granger!(ws, sim.y, sim.x)) < 0.01
+    jr = johansen(simulate_vecm(rng, 400, [-0.15 0.05]', [1.0 -1.2]'))
+    @test johansen_pvalue(jr) < 0.01
+    j3 = johansen(cumsum(randn(rng, 3, 400); dims = 2))
+    @test johansen_pvalue(j3) > 0.001
+    @test johansen_null_distribution(400; k = 3) !== johansen_null_distribution(400; k = 2)
+end
+
+@testset "passive repricing" begin
+    T = 6
+    mid = fill(100.0, 1, T); mid[1, 3] = 100.5; mid[1, 4] = 100.2
+    p = PricePanel(mid; spread = fill(0.1, 1, T), volume = fill(1e5, 1, T), depth = fill(1e3, 1, T))
+    for (rp, expected) in ((false, 99.95), (true, 100.45))
+        sim = ExecutionSimulator(ExecConfig(style = :passive, limit_wait = 3, reprice = rp), 1)
+        book = Book(1e6, 1)
+        submit_ticket!(sim, p, 1, [1], [100.0], 2)
+        process_orders!((a...) -> nothing, sim, book, p, 3)           # price ran away: no fill
+        @test isempty(sim.fills) && sim.pending[1].limit == expected
+        process_orders!((a...) -> nothing, sim, book, p, 4)           # bid 100.15 vs limit
+        @test !isempty(sim.fills) == rp                                # re-pegged order fills
+    end
+end
+
+@testset "result export" begin
+    panel, _ = synthetic_universe(Xoshiro(86); T = 800)
+    res = run_backtest(panel)
+    dir = mktempdir()
+    paths = export_results(dir, res)
+    @test sort(basename.(paths)) == sort(["equity.csv", "bars.csv", "health.csv", "fills.csv", "formations.csv", "summary.csv"])
+    eqlines = readlines(joinpath(dir, "equity.csv"))
+    @test eqlines[1] == "t,timestamp,equity,ret" && length(eqlines) == length(res.t) + 1
+    @test split(eqlines[2], ",")[4] == ""                             # first return is NaN → empty
+    @test occursin("state", readline(joinpath(dir, "health.csv")))
+    @test length(readlines(joinpath(dir, "fills.csv"))) == length(res.fills) + 1
+    tabs = result_tables(res)
+    @test length(tabs.formations.selected) == length(res.formations)
+    @test_throws ArgumentError export_results(dir, res; format = :parquet)
+    p = write_csv(joinpath(dir, "x.csv"), (a = [1, 2], b = ["x,y", "z"], c = [NaN, Inf]))
+    @test readlines(p) == ["a,b,c", "1,\"x,y\",", "2,z,Inf"]
+    @test_throws DimensionMismatch write_csv(joinpath(dir, "bad.csv"), (a = [1], b = [1, 2]))
+end
+
 @testset "synthetic ground truth recovery" begin
     st = recovery_study(Xoshiro(8); nsim = 200, T = 500, beta = 1.2, half_life = 8.0)
     @test st.beta_eg.mean ≈ 1.2 atol = 0.02
@@ -583,6 +736,12 @@ end
     @test_throws ArgumentError load_panel_arrow(gpath)
     pg = load_panel_arrow(gpath; missing_policy = :ffill)
     @test pg.mid[2, :] == [20.0, 20.0, 21.0] && !pg.tradable[2, 2]
+    # result export in Arrow format through the extension
+    res = run_backtest(synthetic_universe(Xoshiro(87); T = 700)[1])
+    adir = mktempdir()
+    ap = export_results(adir, res; format = :arrow)
+    @test all(endswith(".arrow"), ap)
+    @test length(Arrow.Table(joinpath(adir, "fills.arrow")).qty) == length(res.fills)
 end
 
 end

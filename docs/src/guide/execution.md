@@ -33,6 +33,20 @@ filled within `limit_wait` bars crosses as well.
 In the demo, passive execution pays about 42 bps of effective spread against about 2 bps
 for market orders, and its Sharpe ratio turns negative.
 
+### Multi-leg tickets
+
+[`submit_ticket!`](@ref) sends any number of legs as one ticket (baskets use 3–5).
+Legging generalises directly: the first passive fill on any leg turns *every* other
+resting leg of the ticket into a market order.
+
+### Re-pegging
+
+With `limit_wait > 1`, a resting order normally keeps its decision-bar price. Setting
+`reprice = true` re-pegs it to each new touch. Both stay off by default
+(`limit_wait = 1`, `reprice = false`). On daily synthetic bars, resting longer, with or
+without re-pegging, produced *more* legged fills (74 → 160 per run) and a lower Sharpe
+ratio (−0.98 → −1.19) than crossing after one bar.
+
 ## Halts and missing data
 
 `panel.tradable` is `false` on bars that were missing in the source data, had zero volume,

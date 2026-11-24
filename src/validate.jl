@@ -54,7 +54,14 @@ function _check!(errs, c::BacktestConfig)
     _need!(errs, c.selection_fdr == 0 || 1 / (c.null_sims + 1) < c.selection_fdr / max(c.screen_top, 1),
            "null_sims ($(c.null_sims)) is too small to resolve the BH threshold selection_fdr / screen_top")
     _need!(errs, 0 < c.min_tradable_frac <= 1, "min_tradable_frac must be in (0, 1], got $(c.min_tradable_frac)")
-    _need!(errs, c.max_pairs >= 1 && c.screen_top >= 1, "max_pairs and screen_top must be ≥ 1")
+    _need!(errs, c.max_pairs >= 0 && c.screen_top >= 1, "max_pairs must be ≥ 0 and screen_top ≥ 1")
+    _need!(errs, c.max_pairs + c.max_baskets >= 1, "max_pairs + max_baskets must be ≥ 1")
+    _need!(errs, c.max_baskets >= 0, "max_baskets must be ≥ 0, got $(c.max_baskets)")
+    _need!(errs, 3 <= c.basket_size <= JOHANSEN_MAX_K, "basket_size must be in 3:$JOHANSEN_MAX_K, got $(c.basket_size)")
+    _need!(errs, c.basket_screen_top >= 1, "basket_screen_top must be ≥ 1")
+    _need!(errs, 0 <= c.min_basket_weight < 1, "min_basket_weight must be in [0, 1), got $(c.min_basket_weight)")
+    _need!(errs, c.health_window > 11 + (c.basket_size + 1) * c.johansen_lags + c.basket_size || c.max_baskets == 0,
+           "health_window ($(c.health_window)) is too short for $(c.basket_size)-asset baskets")
     lo, hi = c.hl_bounds
     _need!(errs, 0 < lo < hi, "hl_bounds must satisfy 0 < lo < hi, got $(c.hl_bounds)")
     _need!(errs, hi < c.health_window / 2,
@@ -68,6 +75,8 @@ function _check!(errs, c::BacktestConfig)
     _need!(errs, c.innov_window >= 3, "innov_window must be ≥ 3")
     _need!(errs, c.initial_capital > 0, "initial_capital must be positive")
     _need!(errs, c.risk.cov_window < c.formation, "risk.cov_window ($(c.risk.cov_window)) must be < formation ($(c.formation))")
+    c.signal_rule isa CostAwareBands &&
+        _need!(errs, c.signal_rule.cost_multiple >= 0, "CostAwareBands.cost_multiple must be ≥ 0")
     _check!(errs, c.kalman); _check!(errs, c.exec); _check!(errs, c.risk)
 end
 

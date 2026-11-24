@@ -1,21 +1,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-forward event loop: formation → live trading with health gating.
 #
-# Per bar t (single monotonic clock):
-#   1. fills for orders decided at ≤ t − latency are executed on bar-t prices
-#   2. financing / borrow accrue over (t−1, t]
-#   3. every `trading` bars: re-run formation on [t−F+1, t]
-#   4. each pair: ring buffer push, Kalman update (z uses the prior θ), periodic
-#      Engle-Granger + Johansen health check on the W-bar window
-#   5. signals → risk allocator → orders (eligible from t + latency)
-#   6. mark-to-market and telemetry
+# A traded *spread* is either a pair (Kalman hedge ratio) or a basket of k ≥ 3 assets
+# (Johansen cointegrating vector). Per bar t, on a single monotonic clock, the loop
+# runs these stages:
+#
+#   _stage_market!     financing, corporate actions, fills of orders decided ≤ t − latency
+#   _stage_formation!  every `trading` bars: screen, test (FDR), select, calibrate
+#   _stage_models!     filters + periodic Engle-Granger / Johansen health checks
+#   _stage_risk!       maintenance-margin check
+#   _stage_signals!    the configured signal rule (pluggable)
+#   _stage_allocate!   the configured allocator (pluggable), throttle, gross cap, leg split
+#   _stage_orders!     hysteresis-aware order generation (eligible from t + latency)
+#   _stage_record!     mark to market, telemetry
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
     BacktestConfig(; ...)
 
-Walk-forward and signal parameters (see field comments in the source). Nested configs:
-`kalman::KalmanConfig`, `exec::ExecConfig`, `risk::RiskConfig`.
+Walk-forward, selection and signal parameters (see the field comments in the source).
+Nested configs: `kalman::KalmanConfig`, `exec::ExecConfig`, `risk::RiskConfig`.
+Pluggable components: `signal_rule::AbstractSignalRule` (default [`ZScoreBands`](@ref)) and
+`allocator::AbstractAllocator` (default [`DefaultAllocator`](@ref)).
+
+Baskets: with `max_baskets > 0`, formation also tests `basket_size`-asset baskets (built
+by extending the closest screened pairs) with the Johansen test, and trades up to
+`max_baskets` of them alongside the pairs.
 """
 Base.@kwdef struct BacktestConfig
     formation::Int = 252                 # formation window F (bars)
@@ -30,10 +40,14 @@ Base.@kwdef struct BacktestConfig
     min_tradable_frac::Float64 = 0.95    # assets need this share of tradable bars in the formation window
     max_pairs::Int = 10
     screen_top::Int = 100                # candidates kept by the distance screen
+    max_baskets::Int = 0                 # baskets traded alongside pairs (0 = pairs only)
+    basket_size::Int = 3                 # assets per basket (3–5)
+    basket_screen_top::Int = 50          # basket candidates tested per formation
+    min_basket_weight::Float64 = 0.15    # every leg needs |wᵢ| ≥ this × max|w| (else it's a pair in disguise)
     same_sector_only::Bool = true
-    unique_assets::Bool = true           # an asset may appear in at most one selected pair
+    unique_assets::Bool = true           # an asset may appear in at most one selected spread
     hl_bounds::Tuple{Float64,Float64} = (1.0, 60.0)
-    gate_on::Symbol = :johansen          # :johansen | :eg | :either
+    gate_on::Symbol = :johansen          # pairs: :johansen | :eg | :either (baskets: Johansen)
     recover_checks::Int = 2
     z_entry::Float64 = 2.0
     z_exit::Float64 = 0.5
@@ -46,24 +60,59 @@ Base.@kwdef struct BacktestConfig
     kalman::KalmanConfig = KalmanConfig()
     exec::ExecConfig = ExecConfig()
     risk::RiskConfig = RiskConfig()
+    signal_rule::AbstractSignalRule = ZScoreBands()
+    allocator::AbstractAllocator = DefaultAllocator()
 end
 
-"""Return a copy of an immutable config with some fields replaced."""
-function with(cfg::T; kw...) where {T}
+"""
+    reconfigure(cfg; kw...)
+
+Copy of an immutable config (`BacktestConfig`, `ExecConfig`, `RiskConfig`,
+`KalmanConfig`, …) with the given fields replaced:
+`reconfigure(cfg; exec = reconfigure(cfg.exec; style = :passive))`.
+"""
+function reconfigure(cfg::T; kw...) where {T}
+    for k in keys(kw)
+        k in fieldnames(T) || throw(ArgumentError("$T has no field `$k`"))
+    end
     vals = map(fieldnames(T)) do f
         haskey(kw, f) ? kw[f] : getfield(cfg, f)
     end
     T(vals...)
 end
 
-mutable struct PairState
+"""
+    with(cfg; kw...)
+
+Deprecated alias of [`reconfigure`](@ref).
+"""
+function with(cfg; kw...)
+    Base.depwarn("`with(cfg; ...)` is deprecated, use `reconfigure(cfg; ...)`", :with)
+    reconfigure(cfg; kw...)
+end
+
+"""
+    SpreadState
+
+Live state of one traded spread: a pair (`length(assets) == 2`, hedge ratio from a Kalman
+filter) or a basket (Johansen weights, [`BasketFilter`](@ref) signal).
+
+- `assets`, `weights`: legs and log-price hedge weights (`weights[1] = 1`; the spread is
+  `Σ wᵢ log pᵢ`; a pair's weights are `[1, −β_t]`, refreshed every bar)
+- `model`: the filter; `zscore(sp)` is its trading signal
+- `signal` / `last_signal`: desired direction this bar / last bar; `entry_t`, `blocked`
+- `state`: [`HealthState`](@ref); `hl`, `rank`: latest health-check estimates
+- `shares`: filled position per leg; `target`: this bar's target shares per leg
+"""
+mutable struct SpreadState
     id::Int
-    y::Int
-    x::Int
-    kf::Union{KalmanHedge,OUKalmanHedge}
-    ring::MirroredRing        # 2 × W log prices
-    zring::MirroredRing       # standardized innovations
-    rring::MirroredRing       # spread returns (per $1 gross)
+    assets::Vector{Int}
+    weights::Vector{Float64}
+    model::Union{KalmanHedge,OUKalmanHedge,BasketFilter}
+    ring::MirroredRing          # k × W log prices
+    zring::MirroredRing         # standardised innovations
+    rring::MirroredRing         # spread returns per $1 gross
+    spbuf::Vector{Float64}      # scratch for basket spread windows
     state::HealthState
     good::Int
     in_universe::Bool
@@ -74,25 +123,45 @@ mutable struct PairState
     hl::Float64
     rank::Int
     created_t::Int
-    sh_y::Float64
-    sh_x::Float64
+    shares::Vector{Float64}
+    target::Vector{Float64}
 end
 
+"""Number of legs of a spread."""
+nlegs(sp::SpreadState) = length(sp.assets)
+"""`true` for a two-asset spread traded with a Kalman hedge ratio."""
+ispair(sp::SpreadState) = length(sp.assets) == 2
+"""The spread's current trading Z-score."""
+zscore(sp::SpreadState) = sp.model.z
+"""`true` if any leg holds shares."""
+isopen(sp::SpreadState) = any(!iszero, sp.shares)
+_key(assets) = sort(collect(assets))
+
+"""
+    HealthRecord
+
+One health check of one spread: Johansen rank and statistics on the rolling window,
+half-lives (Engle-Granger residual for pairs, Johansen spread for baskets), the
+Engle-Granger statistic and β (pairs only, `NaN` for baskets), the filter's hedge ratio and
+implied half-life, the lag-1 autocorrelation of its standardised innovations, and the
+resulting gate state. `pair` is the spread id, `y`/`x` its first two assets, `k` its size.
+"""
 struct HealthRecord
     t::Int
     pair::Int
     y::Int
     x::Int
+    k::Int
     rank::Int
     trace_r0::Float64
     trace_r1::Float64
     maxeig_r0::Float64
-    half_life::Float64        # Engle-Granger residual OU half-life
+    half_life::Float64
     joh_half_life::Float64
     eg_adf::Float64
     eg_beta::Float64
     kf_beta::Float64
-    kf_half_life::Float64     # implied by the OU filter's φ (Inf for the random-walk model)
+    kf_half_life::Float64
     innov_acf1::Float64
     healthy::Bool
     state::HealthState
@@ -102,7 +171,7 @@ struct BarRecord
     t::Int
     equity::Float64
     gross::Float64
-    n_pairs::Int
+    n_pairs::Int          # live spreads (pairs and baskets)
     n_active::Int
     n_quarantine::Int
     n_open::Int
@@ -111,9 +180,10 @@ end
 """
     FormationRecord
 
-One formation step: bar `t`, number of screened `n_candidates`, number that passed
+One formation step: bar `t`; screened pair candidates `n_candidates`; pairs that passed
 selection (`n_cointegrated`: significant after FDR control and within the half-life
-bounds), the smallest selection p-value, and the `selected` pairs as `(y, x)`.
+bounds); the smallest pair p-value; the `selected` pairs as `(y, x)`; and, for baskets,
+`n_basket_candidates`, `n_basket_significant` and the `baskets` selected.
 """
 struct FormationRecord
     t::Int
@@ -121,6 +191,9 @@ struct FormationRecord
     n_cointegrated::Int
     min_pvalue::Float64
     selected::Vector{NTuple{2,Int}}
+    n_basket_candidates::Int
+    n_basket_significant::Int
+    baskets::Vector{Vector{Int}}
 end
 
 """
@@ -128,7 +201,8 @@ end
 
 Output of [`run_backtest`](@ref): bar indices `t`, `timestamps`, `equity` and `returns`;
 columnar telemetry `bars`, `health` and `fills` (`StructVector`s, so they work with any
-Tables.jl consumer); `formations`; the final `book`; and the config used.
+Tables.jl consumer); `formations`; the final `book`; forced-liquidation bars
+`margin_calls`; and the config used.
 """
 struct BacktestResult
     config::BacktestConfig
@@ -150,20 +224,208 @@ Base.show(io::IO, r::BacktestResult) =
     print(io, "BacktestResult(", length(r.t), " bars, final equity ",
           round(last(r.equity); digits = 2), ", ", length(r.fills), " fills)")
 
+"""
+    SignalContext
+
+What a signal rule or allocator may look at on bar `t`: the config, the panel (only bars
+`≤ t` may be used), the execution simulator's per-asset volatility estimates `sigma2`,
+current `equity`, `can_open` (false during halts or a post-margin-call cooldown) and a
+reusable `overlay` workspace for allocators.
+"""
+struct SignalContext
+    t::Int
+    cfg::BacktestConfig
+    panel::PricePanel
+    sigma2::Vector{Float64}
+    equity::Float64
+    can_open::Bool
+    overlay::OverlayWorkspace
+end
+
+# ─── state ───────────────────────────────────────────────────────────────────
+
+mutable struct BacktestState
+    panel::PricePanel
+    cfg::BacktestConfig
+    clock::Clock
+    sim::ExecutionSimulator
+    book::Book
+    egws::EGWorkspace
+    jws::Dict{Int,JohansenWorkspace}       # health-check workspaces by basket size
+    gate::HealthGateConfig
+    ows::OverlayWorkspace
+    spreads::Vector{SpreadState}
+    byid::Dict{Int,SpreadState}
+    next_id::Int
+    health::StructVector{HealthRecord}
+    bars::StructVector{BarRecord}
+    formations::Vector{FormationRecord}
+    margin_calls::Vector{Int}
+    no_entry_until::Int
+    liquidating::Bool
+    open_sel::Vector{SpreadState}
+    w::Vector{Float64}
+    act::Vector{UInt8}
+end
+
+function BacktestState(panel::PricePanel, cfg::BacktestConfig)
+    n, W = nassets(panel), cfg.health_window
+    jws = Dict{Int,JohansenWorkspace}(2 => JohansenWorkspace(2, W; kdiff = cfg.johansen_lags))
+    cfg.max_baskets > 0 && (jws[cfg.basket_size] = JohansenWorkspace(cfg.basket_size, W; kdiff = cfg.johansen_lags))
+    BacktestState(panel, cfg, Clock(0), ExecutionSimulator(cfg.exec, n), Book(cfg.initial_capital, n),
+                  EGWorkspace(W, cfg.adf_lags), jws,
+                  HealthGateConfig(cfg.hl_bounds, cfg.gate_on, cfg.recover_checks, cfg.coint_level),
+                  OverlayWorkspace(2 * (cfg.max_pairs + cfg.max_baskets)),
+                  SpreadState[], Dict{Int,SpreadState}(), 1,
+                  StructVector{HealthRecord}(undef, 0), StructVector{BarRecord}(undef, 0),
+                  FormationRecord[], Int[], 0, false, SpreadState[], Float64[], UInt8[])
+end
+
 # ─── formation ───────────────────────────────────────────────────────────────
 
-function _formation!(pairs, byid, next_id::Ref{Int}, panel::PricePanel, cfg::BacktestConfig, t::Int,
-                     formations, sim)
-    F, W = cfg.formation, cfg.health_window
+# z-normalised log prices over a window, one column per asset
+function _normalized_window(logp::AbstractMatrix, t::Int, W::Int)
+    n = size(logp, 1)
+    Z = Matrix{Float64}(undef, W, n)
+    for a in 1:n
+        μ = 0.0
+        for s in 1:W
+            μ += logp[a, t-W+s]
+        end
+        μ /= W
+        v = 0.0
+        for s in 1:W
+            d = logp[a, t-W+s] - μ
+            Z[s, a] = d
+            v += d * d
+        end
+        sd = sqrt(v / (W - 1))
+        @views Z[:, a] ./= (sd > 0 ? sd : 1.0)
+    end
+    Z
+end
+
+@inline function _ssd(Z::Matrix{Float64}, i::Int, j::Int)
+    d = 0.0
+    @inbounds @simd for s in 1:size(Z, 1)
+        d += (Z[s, i] - Z[s, j])^2
+    end
+    d
+end
+
+"""
+    basket_candidates(logp, pairs, t, W, k; top=50, sector=nothing, same_sector=true, eligible=nothing)
+
+Grow each screened pair into a `k`-asset basket by repeatedly adding the eligible asset
+with the smallest total normalised distance to the current members (within the sector
+if `same_sector`). Returns up to `top` distinct baskets (sorted asset lists), in the order
+of the pairs they grew from.
+"""
+function basket_candidates(logp::AbstractMatrix, pairs::AbstractVector{NTuple{2,Int}}, t::Integer, W::Integer,
+                           k::Integer; top::Integer = 50, sector = nothing, same_sector::Bool = true,
+                           eligible = nothing)
+    n = size(logp, 1)
+    Z = _normalized_window(logp, Int(t), Int(W))
+    seen = Set{Vector{Int}}()
+    out = Vector{Int}[]
+    for (i, j) in pairs
+        length(out) >= top && break
+        members = [i, j]
+        while length(members) < k
+            best, bestd = 0, Inf
+            for m in 1:n
+                m in members && continue
+                (eligible !== nothing && !eligible[m]) && continue
+                (same_sector && sector !== nothing && sector[m] != sector[i]) && continue
+                d = 0.0
+                for a in members
+                    d += _ssd(Z, m, a)
+                end
+                d < bestd && ((best, bestd) = (m, d))
+            end
+            best == 0 && break
+            push!(members, best)
+        end
+        length(members) == k || continue
+        key = sort(members)
+        key in seen && continue
+        push!(seen, key)
+        push!(out, key)
+    end
+    out
+end
+
+function _new_spread!(st::BacktestState, assets::Vector{Int}, weights::Vector{Float64}, model, t::Int, hl::Float64)
+    cfg, logp = st.cfg, st.panel.logmid
+    F, W, L = cfg.formation, cfg.health_window, cfg.risk.cov_window
+    k = length(assets)
+    zr = MirroredRing(1, cfg.innov_window)
+    _warmup!(model, zr, logp, assets, weights, t-F+1:t)
+    if k == 2
+        # the warm-up moved β: refresh the leg weights and measure the half-life with it
+        weights[2] = -hedge_ratio(model)
+        rng = t-F+1:t
+        hl = ou_half_life(view(logp, assets[1], rng) .+ weights[2] .* view(logp, assets[2], rng))
+    end
+    ring = MirroredRing(k, W)
+    for τ in t-W+1:t
+        push_column!(ring, logp, assets, τ)
+    end
+    rr = MirroredRing(1, L)
+    wsum = sum(abs, weights)
+    for τ in t-L+1:t
+        r = 0.0
+        for (l, a) in enumerate(assets)
+            r += weights[l] * (logp[a, τ] - logp[a, τ-1])
+        end
+        push!(rr, r / wsum)
+    end
+    sp = SpreadState(st.next_id, assets, weights, model, ring, zr, rr, zeros(k == 2 ? 0 : W), ACTIVE, 0, true,
+                     0, 0, 0, false, hl, 1, t, zeros(k), zeros(k))
+    st.next_id += 1
+    push!(st.spreads, sp)
+    st.byid[sp.id] = sp
+    sp
+end
+
+# Run a freshly calibrated filter through the formation window (function barrier: the
+# model arrives as one of three concrete types), recording innovations for telemetry.
+function _warmup!(model, zr::MirroredRing, logp, assets, weights, rng)
+    for τ in rng
+        _filter_step!(model, logp, assets, weights, τ)
+        push!(zr, innovation_z(model))
+    end
+    model.P_ref = _ref_variance(model)
+    model
+end
+
+_ref_variance(m::Union{KalmanHedge,OUKalmanHedge}) = m.P[2, 2]
+_ref_variance(m::BasketFilter) = m.P[2, 2]
+
+@inline _filter_step!(m::Union{KalmanHedge,OUKalmanHedge}, logp, assets, weights, τ) =
+    kalman_update!(m, logp[assets[1], τ], logp[assets[2], τ])
+@inline function _filter_step!(m::BasketFilter, logp, assets, weights, τ)
+    v = 0.0
+    @inbounds for l in eachindex(assets)
+        v += weights[l] * logp[assets[l], τ]
+    end
+    kalman_update!(m, v)
+end
+
+function _stage_formation!(st::BacktestState, t::Int)
+    cfg, panel = st.cfg, st.panel
+    F = cfg.formation
     logp = panel.logmid
+    lo, hi = cfg.hl_bounds
     # assets with enough real (tradable) bars in the window and tradable right now
     eligible = [panel.tradable[a, t] && count(view(panel.tradable, a, t-F+1:t)) >= cfg.min_tradable_frac * F
                 for a in 1:nassets(panel)]
     cands = distance_screen(logp, t, F; top = cfg.screen_top, sector = panel.sector,
                             same_sector = cfg.same_sector_only, eligible = eligible)
+
+    # ── pairs: Engle-Granger + Johansen, FDR across candidates ──
     tests = test_pairs(logp, cands, t, F; adf_lags = cfg.adf_lags, kdiff = cfg.johansen_lags,
                        level = cfg.coint_level, threaded = cfg.threaded_formation)
-    lo, hi = cfg.hl_bounds
     if cfg.selection_fdr > 0
         pv = pair_pvalues(tests, F; lags = cfg.adf_lags, kdiff = cfg.johansen_lags, nsim = cfg.null_sims)
         significant = benjamini_hochberg(pv, cfg.selection_fdr)
@@ -187,315 +449,333 @@ function _formation!(pairs, byid, next_id::Ref{Int}, panel::PricePanel, cfg::Bac
         end
         push!(selected, (pt.y, pt.x))
     end
-    push!(formations, FormationRecord(t, length(cands), length(good),
-                                      isempty(pv) ? NaN : minimum(pv), selected))
 
-    # Pairs are identified by their asset set, not orientation: a pair re-selected as
-    # (x, y) keeps its existing live state instead of opening a second position.
-    selset = Set(minmax(p...) for p in selected)
-    existing = Set{NTuple{2,Int}}()
-    for ps in pairs
-        key = minmax(ps.y, ps.x)
+    # ── baskets: Johansen on k-asset candidates, FDR across candidates ──
+    bsel = Vector{Int}[]
+    bweights = Vector{Float64}[]
+    bhl = Float64[]
+    nbc = nbs = 0
+    if cfg.max_baskets > 0
+        k = cfg.basket_size
+        bc = basket_candidates(logp, cands, t, F, k; top = cfg.basket_screen_top, sector = panel.sector,
+                               same_sector = cfg.same_sector_only, eligible = eligible)
+        nbc = length(bc)
+        scans = scan_johansen(logp, bc, t, F; kdiff = cfg.johansen_lags, level = cfg.coint_level,
+                              threaded = cfg.threaded_formation)
+        if cfg.selection_fdr > 0
+            nd = johansen_null_distribution(F; k = k, kdiff = cfg.johansen_lags, nsim = cfg.null_sims)
+            bp = [r.ok ? null_pvalue(nd, r.trace[1]) : 1.0 for r in scans]
+            bsig = benjamini_hochberg(bp, cfg.selection_fdr)
+        else
+            bp = [r.ok ? -r.trace[1] : Inf for r in scans]
+            bsig = [r.ok && r.rank >= 1 for r in scans]
+        end
+        # a basket whose cointegrating vector barely uses a leg is a pair in disguise
+        legs_ok(β) = all(isfinite, β) && minimum(abs, β) >= cfg.min_basket_weight * maximum(abs, β)
+        bkeep = [i for i in eachindex(scans) if bsig[i] && lo <= scans[i].half_life <= hi &&
+                 legs_ok(view(scans[i].beta, 1:k))]
+        nbs = length(bkeep)
+        for i in bkeep[sortperm(bp[bkeep])]
+            length(bsel) >= cfg.max_baskets && break
+            r = scans[i]
+            if cfg.unique_assets
+                any(in(used), r.basket) && continue
+                union!(used, r.basket)
+            end
+            push!(bsel, r.basket)
+            push!(bweights, r.beta[1:k])
+            push!(bhl, r.half_life)
+        end
+    end
+    push!(st.formations, FormationRecord(t, length(cands), length(good), isempty(pv) ? NaN : minimum(pv),
+                                         selected, nbc, nbs, bsel))
+
+    # ── universe update: spreads are identified by their asset set ──
+    selkeys = Set{Vector{Int}}(_key(p) for p in selected)
+    union!(selkeys, _key(b) for b in bsel)
+    existing = Set{Vector{Int}}()
+    for sp in st.spreads
+        key = _key(sp.assets)
         push!(existing, key)
-        ps.in_universe = key in selset
+        sp.in_universe = key in selkeys
     end
     rng = t-F+1:t
     for (yi, xi) in selected
-        minmax(yi, xi) in existing && continue          # retained pair keeps its live filter
-        yv = view(logp, yi, rng); xv = view(logp, xi, rng)
-        kf = calibrate_filter(yv, xv, cfg.kalman; warmup = false)
-        zr = MirroredRing(1, cfg.innov_window)
-        _warmup!(kf, zr, yv, xv)
-        ring = MirroredRing(2, W)
-        for τ in t-W+1:t
-            push!(ring, (logp[yi, τ], logp[xi, τ]))
-        end
-        L = cfg.risk.cov_window
-        rr = MirroredRing(1, L)
-        β = hedge_ratio(kf)
-        for τ in t-L+1:t
-            push!(rr, ((logp[yi, τ] - logp[yi, τ-1]) - β * (logp[xi, τ] - logp[xi, τ-1])) / (1 + abs(β)))
-        end
-        eg_hl = ou_half_life(view(logp, yi, rng) .- β .* view(logp, xi, rng))
-        id = next_id[]
-        next_id[] += 1
-        ps = PairState(id, yi, xi, kf, ring, zr, rr, ACTIVE, 0, true, 0, 0, 0, false,
-                       eg_hl, 1, t, 0.0, 0.0)
-        push!(pairs, ps)
-        byid[id] = ps
+        _key((yi, xi)) in existing && continue             # retained spread keeps its live filter
+        model = calibrate_filter(view(logp, yi, rng), view(logp, xi, rng), cfg.kalman; warmup = false)
+        _new_spread!(st, [yi, xi], [1.0, -hedge_ratio(model)], model, t, NaN)
+    end
+    for (b, w, hl) in zip(bsel, bweights, bhl)
+        _key(b) in existing && continue
+        v = [sum(w[l] * logp[b[l], τ] for l in eachindex(b)) for τ in rng]
+        model = calibrate_basket_filter(v, cfg.kalman; warmup = false)
+        _new_spread!(st, copy(b), copy(w), model, t, hl)
     end
     nothing
 end
 
-# Run a freshly calibrated filter through the formation window (function barrier: `kf`
-# arrives as one of two concrete types), recording innovations for the telemetry ring.
-function _warmup!(kf, zr::MirroredRing, yv::AbstractVector, xv::AbstractVector)
-    @inbounds for s in eachindex(yv)
-        kalman_update!(kf, yv[s], xv[s])
-        push!(zr, innovation_z(kf))
+# ─── per-bar models & health ─────────────────────────────────────────────────
+
+function _update_spread!(st::BacktestState, sp::SpreadState, t::Int)
+    cfg, logp = st.cfg, st.panel.logmid
+    k = nlegs(sp)
+    # spread return over (t−1, t] with last bar's weights
+    r = 0.0; wsum = 0.0
+    @inbounds for l in 1:k
+        a = sp.assets[l]
+        r += sp.weights[l] * (logp[a, t] - latest(sp.ring, l))
+        wsum += abs(sp.weights[l])
     end
-    kf.P_ref = kf.P[2, 2]
-    kf
+    push_column!(sp.ring, logp, sp.assets, t)
+    _filter_step!(sp.model, logp, sp.assets, sp.weights, t)
+    ispair(sp) && (sp.weights[2] = -hedge_ratio(sp.model))
+    push!(sp.zring, innovation_z(sp.model))
+    push!(sp.rring, r / wsum)
+    (t - sp.created_t) % cfg.health_every == 0 && _health_check!(st, sp, t)
+    nothing
 end
 
-# ─── per-bar pair update & health ────────────────────────────────────────────
-
-function _update_pair!(ps::PairState, panel::PricePanel, cfg::BacktestConfig, t::Int,
-                       egws::EGWorkspace, jws::JohansenWorkspace, gate::HealthGateConfig, health)
-    y = panel.logmid[ps.y, t]; x = panel.logmid[ps.x, t]
-    yprev = latest(ps.ring, 1); xprev = latest(ps.ring, 2)
-    βprev = hedge_ratio(ps.kf)
-    push!(ps.ring, (y, x))
-    kalman_update!(ps.kf, y, x)
-    push!(ps.zring, innovation_z(ps.kf))
-    push!(ps.rring, ((y - yprev) - βprev * (x - xprev)) / (1 + abs(βprev)))
-    if (t - ps.created_t) % cfg.health_every == 0
-        eg = engle_granger!(egws, window(ps.ring, 1), window(ps.ring, 2); lags = cfg.adf_lags)
-        js = johansen!(jws, window(ps.ring); level = cfg.coint_level)
-        ok = healthy(gate, js, eg)
+function _health_check!(st::BacktestState, sp::SpreadState, t::Int)
+    cfg = st.cfg
+    jws = st.jws[nlegs(sp)]
+    js = johansen!(jws, window(sp.ring); level = cfg.coint_level)
+    lo, hi = cfg.hl_bounds
+    if ispair(sp)
+        eg = engle_granger!(st.egws, window(sp.ring, 1), window(sp.ring, 2); lags = cfg.adf_lags)
+        ok = healthy(st.gate, js, eg)
+        hl, egadf, egβ = eg.half_life, eg.adf, eg.beta
         if cfg.kalman.recalibrate                 # re-fit the OU dynamics on the window
-            xw = window(ps.ring, 2)
-            recalibrate!(ps.kf, view(egws.resid, 1:length(xw)), cfg.kalman, sum(xw) / length(xw))
+            xw = window(sp.ring, 2)
+            recalibrate!(sp.model, view(st.egws.resid, 1:length(xw)), cfg.kalman, sum(xw) / length(xw))
         end
-        ps.state, ps.good = gate_transition(gate, ps.state, ps.good, ok)
-        ps.hl = eg.half_life
-        ps.rank = js.rank
-        acf1 = autocor_lag(filled_window(ps.zring, 1), 1)
-        push!(health, HealthRecord(t, ps.id, ps.y, ps.x, js.rank, js.trace_r0, js.trace_r1, js.maxeig_r0,
-                                   eg.half_life, js.half_life, eg.adf, eg.beta, hedge_ratio(ps.kf),
-                                   model_half_life(ps.kf), acf1, ok, ps.state))
+        kfβ = hedge_ratio(sp.model)
+    else
+        hl = js.half_life
+        ok = js.ok && js.rank >= 1 && lo <= hl <= hi
+        egadf = egβ = kfβ = NaN
+        if cfg.kalman.recalibrate                 # re-fit on this spread's own window
+            buf = sp.spbuf
+            Wn = sp.ring.W
+            for s in 1:Wn
+                v = 0.0
+                for l in 1:nlegs(sp)
+                    v += sp.weights[l] * window(sp.ring, l)[s]
+                end
+                buf[s] = v
+            end
+            μ = sum(buf) / Wn
+            buf .-= μ
+            recalibrate!(sp.model, buf, cfg.kalman, 0.0)
+        end
     end
+    sp.state, sp.good = gate_transition(st.gate, sp.state, sp.good, ok)
+    sp.hl = hl
+    sp.rank = js.rank
+    acf1 = autocor_lag(filled_window(sp.zring, 1), 1)
+    push!(st.health, HealthRecord(t, sp.id, sp.assets[1], sp.assets[2], nlegs(sp), js.rank, js.trace_r0,
+                                  js.trace_r1, js.maxeig_r0, hl, js.half_life, egadf, egβ, kfβ,
+                                  model_half_life(sp.model), acf1, ok, sp.state))
     nothing
 end
 
-function _update_signal!(ps::PairState, cfg::BacktestConfig, t::Int, can_open::Bool)
-    ps.last_signal = ps.signal
-    z = ps.kf.z
-    if !(ps.state == ACTIVE && ps.in_universe)
-        ps.signal = 0
-        return
+function _stage_models!(st::BacktestState, t::Int)
+    tr = st.panel.tradable
+    for sp in st.spreads
+        sp.created_t == t && continue
+        # a stale (missing / halted) quote carries no new information
+        all(a -> tr[a, t], sp.assets) || continue
+        _update_spread!(st, sp, t)
     end
-    if ps.blocked
-        abs(z) < cfg.z_exit && (ps.blocked = false)
-        ps.signal = 0
-        return
-    end
-    if ps.signal == 0
-        can_open || return
-        if z > cfg.z_entry
-            ps.signal = -1; ps.entry_t = t
-        elseif z < -cfg.z_entry
-            ps.signal = 1; ps.entry_t = t
+end
+
+# ─── market, risk, signals, allocation, orders ───────────────────────────────
+
+function _stage_market!(st::BacktestState, t::Int)
+    panel, sim, book = st.panel, st.sim, st.book
+    if t > st.cfg.formation
+        update_vol!(sim, panel, t)
+        accrue_financing!(book, panel, st.cfg.exec, t)
+        apply_corporate_actions!(sim, book, panel, t) do a, ratio
+            for sp in st.spreads, l in eachindex(sp.assets)
+                sp.assets[l] == a && (sp.shares[l] *= ratio)
+            end
+        end
+        process_orders!(sim, book, panel, t) do id, leg, q
+            st.byid[id].shares[leg] += q
         end
     else
-        hl_assumed = isfinite(ps.hl) ? ps.hl * cfg.hl_scale : Inf
-        if abs(z) > cfg.z_stop || (t - ps.entry_t) > cfg.max_hold_halflives * hl_assumed
-            ps.signal = 0
-            ps.blocked = true
-        elseif ps.signal * z > -cfg.z_exit
-            ps.signal = 0
+        for τ in 2:t              # seed the impact-model volatility from history
+            update_vol!(sim, panel, τ)
         end
     end
-    nothing
 end
 
-# ─── main loop ───────────────────────────────────────────────────────────────
+# maintenance margin: returns (equity, liquidate?)
+function _stage_risk!(st::BacktestState, t::Int)
+    E = equity(st.book, st.panel, t)
+    G = gross_exposure(st.book, st.panel, t)
+    liquidate = false
+    if G > 0 && (E <= 0 || E < st.cfg.risk.maintenance_margin * G)
+        liquidate = true
+        st.liquidating || push!(st.margin_calls, t)
+        st.liquidating = true
+        st.no_entry_until = E <= 0 ? typemax(Int) : t + st.cfg.risk.liquidation_cooldown
+    elseif G == 0
+        st.liquidating = false
+    end
+    E, liquidate
+end
 
-# per-pair order actions for one bar
+function _stage_signals!(st::BacktestState, t::Int, E::Float64, liquidate::Bool, rule::AbstractSignalRule)
+    tr = st.panel.tradable
+    for sp in st.spreads
+        sp.last_signal = sp.signal
+        if liquidate || !(sp.state == ACTIVE && sp.in_universe)
+            sp.signal = 0
+            continue
+        end
+        can_open = t >= st.no_entry_until && all(a -> tr[a, t], sp.assets)
+        update_signal!(rule, sp, SignalContext(t, st.cfg, st.panel, st.sim.sigma2, E, can_open, st.ows))
+    end
+end
+
+function _stage_allocate!(st::BacktestState, t::Int, E::Float64, alloc::AbstractAllocator)
+    cfg, panel = st.cfg, st.panel
+    C = cfg.risk.pair_cap * max(E, 0.0)
+    sel = st.open_sel
+    empty!(sel)
+    for sp in st.spreads
+        sp.signal != 0 && push!(sel, sp)
+        fill!(sp.target, 0.0)
+    end
+    w = st.w
+    resize!(w, length(sel))
+    isempty(sel) && return C
+    target_weights!(alloc, w, sel, SignalContext(t, cfg, panel, st.sim.sigma2, E, true, st.ows))
+    gross = 0.0
+    for (j, sp) in enumerate(sel)
+        cfg.risk.throttle_uncertainty && (w[j] *= size_multiplier(sp.model))
+        gross += abs(w[j]) * C
+    end
+    scale = gross > cfg.risk.max_gross * E ? cfg.risk.max_gross * E / gross : 1.0
+    for (j, sp) in enumerate(sel)
+        G = w[j] * C * scale
+        wsum = sum(abs, sp.weights)
+        for (l, a) in enumerate(sp.assets)
+            sp.target[l] = round(G * sp.weights[l] / wsum / panel.mid[a, t])
+        end
+    end
+    C
+end
+
+# per-spread order actions for one bar
 const ACT_NONE = 0x00      # within the rebalance band: leave it
 const ACT_WAIT = 0x01      # orders in flight toward an earlier target
 const ACT_SUBMIT = 0x02    # trade to target
 const ACT_REPLACE = 0x03   # cancel anything in flight, then trade to target
 
+_haspending(sim::ExecutionSimulator, id::Int) = any(o -> o.pair == id, sim.pending)
+
+function _stage_orders!(st::BacktestState, t::Int, E::Float64, C::Float64, liquidate::Bool)
+    cfg, panel, sim = st.cfg, st.panel, st.sim
+    if liquidate
+        for sp in st.spreads
+            _haspending(sim, sp.id) && cancel_pair!(sim, sp.id)
+            isopen(sp) && submit_ticket!(sim, panel, sp.id, sp.assets, .-sp.shares, t)
+        end
+        return
+    end
+    # Pass 1: the action the rebalance hysteresis would take, and the gross the book would
+    # end up with (spreads that don't trade keep their holdings plus anything in flight).
+    act = st.act
+    resize!(act, length(st.spreads))
+    projected = 0.0
+    for (i, sp) in enumerate(st.spreads)
+        dev = 0.0
+        for (l, a) in enumerate(sp.assets)
+            dev += abs(sp.target[l] - sp.shares[l]) * panel.mid[a, t]
+        end
+        act[i] = if sp.signal != sp.last_signal
+            ACT_REPLACE
+        elseif _haspending(sim, sp.id)
+            ACT_WAIT
+        elseif sp.signal == 0 && isopen(sp)
+            ACT_SUBMIT
+        elseif sp.signal != 0 && dev > cfg.risk.min_trade_frac * C
+            ACT_SUBMIT
+        else
+            ACT_NONE
+        end
+        for (l, a) in enumerate(sp.assets)
+            q = (act[i] == ACT_REPLACE || act[i] == ACT_SUBMIT) ? sp.target[l] :
+                sp.shares[l] + pending_qty(sim, sp.id, l)
+            projected += abs(q) * panel.mid[a, t]
+        end
+    end
+    # Hysteresis must never let the book exceed max_gross: if it would, every open spread
+    # is brought to its (jointly capped) target this bar.
+    if projected > cfg.risk.max_gross * max(E, 0.0) * (1 + 1e-9)
+        for i in eachindex(act)
+            act[i] == ACT_NONE && (act[i] = ACT_SUBMIT)
+            act[i] == ACT_WAIT && (act[i] = ACT_REPLACE)
+        end
+    end
+    # Pass 2: send orders
+    for (i, sp) in enumerate(st.spreads)
+        act[i] == ACT_REPLACE && _haspending(sim, sp.id) && cancel_pair!(sim, sp.id)
+        if act[i] == ACT_REPLACE || act[i] == ACT_SUBMIT
+            d = sp.target .- sp.shares
+            any(!iszero, d) && submit_ticket!(sim, panel, sp.id, sp.assets, d, t)
+        end
+    end
+end
+
+function _stage_record!(st::BacktestState, t::Int)
+    # retire flat spreads that dropped out of the universe
+    filter!(st.spreads) do sp
+        keep = sp.in_universe || isopen(sp) || _haspending(st.sim, sp.id)
+        keep || (sp.state = RETIRED)
+        keep
+    end
+    e = equity(st.book, st.panel, t)
+    sps = st.spreads
+    push!(st.bars, BarRecord(t, e, gross_exposure(st.book, st.panel, t), length(sps),
+                             count(sp -> sp.state == ACTIVE, sps), count(sp -> sp.state == QUARANTINE, sps),
+                             count(isopen, sps)))
+    e
+end
+
+# ─── main loop ───────────────────────────────────────────────────────────────
+
 """
     run_backtest(panel, cfg=BacktestConfig()) -> BacktestResult
 
-Walk-forward statistical-arbitrage backtest. See the module docstring for the event order.
+Walk-forward statistical-arbitrage backtest over pairs (and baskets if
+`cfg.max_baskets > 0`). Validates the configuration first ([`validate_config`](@ref)).
 """
 function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
     validate_config(cfg, panel)
-    n, T = nassets(panel), ntimes(panel)
-    F, W = cfg.formation, cfg.health_window
+    _run_backtest(panel, cfg, cfg.signal_rule, cfg.allocator)
+end
 
-    clock = Clock(0)
-    sim = ExecutionSimulator(cfg.exec, n)
-    book = Book(cfg.initial_capital, n)
-    egws = EGWorkspace(W, cfg.adf_lags)
-    jws = JohansenWorkspace(2, W; kdiff = cfg.johansen_lags)
-    gate = HealthGateConfig(cfg.hl_bounds, cfg.gate_on, cfg.recover_checks, cfg.coint_level)
-    ows = OverlayWorkspace(2 * cfg.max_pairs)
-
-    pairs = PairState[]
-    byid = Dict{Int,PairState}()
-    next_id = Ref(1)
-    health = StructVector{HealthRecord}(undef, 0)
-    bars = StructVector{BarRecord}(undef, 0)
-    formations = FormationRecord[]
-
-    on_fill = (pid, leg, q) -> begin
-        ps = byid[pid]
-        leg == 1 ? (ps.sh_y += q) : (ps.sh_x += q)
-    end
-    on_split = (a, ratio) -> begin
-        for ps in pairs
-            ps.y == a && (ps.sh_y *= ratio)
-            ps.x == a && (ps.sh_x *= ratio)
-        end
-    end
-    margin_calls = Int[]
-    no_entry_until = 0          # entries blocked before this bar (after a margin call)
-    liquidating = false
-
-    # scratch for allocation
-    sel = Int[]; sig = Float64[]; kap = Float64[]; w = Float64[]
-    tgt_y = Float64[]; tgt_x = Float64[]; act = UInt8[]
-    rets = Vector{SubArray{Float64,1,Matrix{Float64},Tuple{Int,UnitRange{Int}},true}}()
-
+# function barrier: specialise on the concrete rule and allocator types
+function _run_backtest(panel::PricePanel, cfg::BacktestConfig, rule::R, alloc::A) where {R<:AbstractSignalRule,A<:AbstractAllocator}
+    st = BacktestState(panel, cfg)
+    F, T = cfg.formation, ntimes(panel)
     ts = F:T
     eq = zeros(length(ts))
     for (k, t) in enumerate(ts)
-        tick!(clock, t)
-        if t > F
-            update_vol!(sim, panel, t)
-            accrue_financing!(book, panel, cfg.exec, t)
-            apply_corporate_actions!(on_split, sim, book, panel, t)
-            process_orders!(on_fill, sim, book, panel, t)
-        else
-            for τ in 2:t          # seed the impact-model volatility from history
-                update_vol!(sim, panel, τ)
-            end
-        end
-        if (t - F) % cfg.trading == 0
-            _formation!(pairs, byid, next_id, panel, cfg, t, formations, sim)
-        end
-        for ps in pairs
-            ps.created_t == t && continue
-            # a stale (missing / halted) quote carries no new information
-            (panel.tradable[ps.y, t] && panel.tradable[ps.x, t]) || continue
-            _update_pair!(ps, panel, cfg, t, egws, jws, gate, health)
-        end
-
-        # ── margin check: liquidate everything below maintenance margin ──
-        E = equity(book, panel, t)
-        G = gross_exposure(book, panel, t)
-        liquidate = false
-        if G > 0 && (E <= 0 || E < cfg.risk.maintenance_margin * G)
-            liquidate = true
-            liquidating || push!(margin_calls, t)
-            liquidating = true
-            no_entry_until = E <= 0 ? typemax(Int) : t + cfg.risk.liquidation_cooldown
-        elseif G == 0
-            liquidating = false
-        end
-
-        for ps in pairs
-            can_open = t >= no_entry_until && panel.tradable[ps.y, t] && panel.tradable[ps.x, t]
-            _update_signal!(ps, cfg, t, can_open)
-            liquidate && (ps.signal = 0)
-        end
-
-        # ── risk allocation ──
-        C = cfg.risk.pair_cap * max(E, 0.0)
-        empty!(sel); empty!(sig); empty!(kap); empty!(rets)
-        for (i, ps) in enumerate(pairs)
-            if ps.signal != 0
-                push!(sel, i); push!(sig, ps.signal)
-                hl = ps.hl * cfg.hl_scale
-                push!(kap, isfinite(hl) && hl > 0 ? log(2.0) / hl : 0.0)
-                push!(rets, window(ps.rring, 1))
-            end
-        end
-        resize!(w, length(sel))
-        if cfg.risk.correlation_overlay && length(sel) >= 2
-            overlay_weights!(w, ows, rets, sig, kap, cfg.risk.shrinkage)
-        else
-            w .= sig
-        end
-        gross = 0.0
-        for (j, i) in enumerate(sel)
-            u = cfg.risk.throttle_uncertainty ? size_multiplier(pairs[i].kf) : 1.0
-            w[j] *= u
-            gross += abs(w[j]) * C
-        end
-        scale = gross > cfg.risk.max_gross * E ? cfg.risk.max_gross * E / gross : 1.0
-
-        # ── orders ──
-        if liquidate
-            for ps in pairs
-                any(o -> o.pair == ps.id, sim.pending) && cancel_pair!(sim, ps.id)
-                (ps.sh_y != 0 || ps.sh_x != 0) &&
-                    submit_pair!(sim, panel, ps.id, (ps.y, ps.x), (-ps.sh_y, -ps.sh_x), t)
-            end
-        else
-            # Pass 1: targets and the action the rebalance hysteresis would take. Then
-            # project the gross the book would end up with: pairs that don't trade keep
-            # their holdings (plus anything in flight), pairs that trade go to target.
-            np = length(pairs)
-            resize!(tgt_y, np); resize!(tgt_x, np); resize!(act, np)
-            projected = 0.0
-            j = 0
-            for (i, ps) in enumerate(pairs)
-                my = panel.mid[ps.y, t]; mx = panel.mid[ps.x, t]
-                if ps.signal != 0
-                    j += 1
-                    tgt_y[i], tgt_x[i] = leg_shares(w[j] * C * scale, hedge_ratio(ps.kf), my, mx)
-                else
-                    tgt_y[i], tgt_x[i] = 0.0, 0.0
-                end
-                haspend = any(o -> o.pair == ps.id, sim.pending)
-                dy = tgt_y[i] - ps.sh_y; dx = tgt_x[i] - ps.sh_x
-                act[i] = if ps.signal != ps.last_signal
-                    ACT_REPLACE
-                elseif haspend
-                    ACT_WAIT
-                elseif ps.signal == 0 && (ps.sh_y != 0 || ps.sh_x != 0)
-                    ACT_SUBMIT
-                elseif ps.signal != 0 && abs(dy) * my + abs(dx) * mx > cfg.risk.min_trade_frac * C
-                    ACT_SUBMIT
-                else
-                    ACT_NONE
-                end
-                if act[i] == ACT_REPLACE || act[i] == ACT_SUBMIT
-                    projected += abs(tgt_y[i]) * my + abs(tgt_x[i]) * mx
-                else
-                    projected += abs(ps.sh_y + pending_qty(sim, ps.id, 1)) * my +
-                                 abs(ps.sh_x + pending_qty(sim, ps.id, 2)) * mx
-                end
-            end
-            # Hysteresis must never let the book exceed max_gross: if it would, every open
-            # pair is brought to its (jointly capped) target this bar.
-            if projected > cfg.risk.max_gross * max(E, 0.0) * (1 + 1e-9)
-                for i in 1:np
-                    act[i] == ACT_NONE && (act[i] = ACT_SUBMIT)
-                    act[i] == ACT_WAIT && (act[i] = ACT_REPLACE)
-                end
-            end
-            # Pass 2: send orders
-            for (i, ps) in enumerate(pairs)
-                dy = tgt_y[i] - ps.sh_y; dx = tgt_x[i] - ps.sh_x
-                if act[i] == ACT_REPLACE
-                    any(o -> o.pair == ps.id, sim.pending) && cancel_pair!(sim, ps.id)
-                    (dy != 0 || dx != 0) && submit_pair!(sim, panel, ps.id, (ps.y, ps.x), (dy, dx), t)
-                elseif act[i] == ACT_SUBMIT && (dy != 0 || dx != 0)
-                    submit_pair!(sim, panel, ps.id, (ps.y, ps.x), (dy, dx), t)
-                end
-            end
-        end
-
-        # ── retire flat pairs that dropped out of the universe ──
-        filter!(pairs) do ps
-            keep = ps.in_universe || ps.sh_y != 0 || ps.sh_x != 0 || any(o -> o.pair == ps.id, sim.pending)
-            keep || (ps.state = RETIRED)
-            keep
-        end
-
-        eq[k] = equity(book, panel, t)
-        na = count(ps -> ps.state == ACTIVE, pairs)
-        nq = count(ps -> ps.state == QUARANTINE, pairs)
-        no = count(ps -> ps.sh_y != 0 || ps.sh_x != 0, pairs)
-        push!(bars, BarRecord(t, eq[k], gross_exposure(book, panel, t), length(pairs), na, nq, no))
+        tick!(st.clock, t)
+        _stage_market!(st, t)
+        (t - F) % cfg.trading == 0 && _stage_formation!(st, t)
+        _stage_models!(st, t)
+        E, liquidate = _stage_risk!(st, t)
+        _stage_signals!(st, t, E, liquidate, rule)
+        C = _stage_allocate!(st, t, E, alloc)
+        _stage_orders!(st, t, E, C, liquidate)
+        eq[k] = _stage_record!(st, t)
     end
-    rets_out = [eq[k] / eq[k-1] - 1 for k in 2:length(eq)]
-    BacktestResult(cfg, collect(ts), panel.timestamps[ts], eq, rets_out, bars, health, sim.fills,
-                   formations, book, margin_calls, panel.bars_per_year, panel.symbols)
+    rets = [eq[k] / eq[k-1] - 1 for k in 2:length(eq)]
+    BacktestResult(cfg, collect(ts), panel.timestamps[ts], eq, rets, st.bars, st.health, st.sim.fills,
+                   st.formations, st.book, st.margin_calls, panel.bars_per_year, panel.symbols)
 end

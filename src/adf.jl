@@ -130,7 +130,8 @@ end
     EGResult
 
 Engle-Granger result: cointegrating regression `alpha`, `beta`; residual `adf` statistic;
-MacKinnon critical values `crit` (1%, 5%, 10%); residual OU `half_life`; `resid_std`; `nobs`.
+MacKinnon critical values `crit` (1%, 5%, 10%); residual OU `half_life`; `resid_std`;
+`nobs`; and the ADF lag order `lags`. For an exact p-value see [`eg_pvalue`](@ref).
 """
 struct EGResult
     alpha::Float64
@@ -140,6 +141,7 @@ struct EGResult
     half_life::Float64
     resid_std::Float64
     nobs::Int
+    lags::Int
 end
 
 """`true` if the Engle-Granger statistic rejects “no cointegration” at `level`."""
@@ -175,5 +177,5 @@ function engle_granger!(ws::EGWorkspace, y::AbstractVector, x::AbstractVector; l
     end
     e = view(r, 1:n)
     a = _adf_reg!(ws.ols, e, lags, false, lags + 2)
-    EGResult(α, β, a.stat, mackinnon_crit(2, n), ou_half_life(e), sqrt(ss / (n - 2)), n)
+    EGResult(α, β, a.stat, mackinnon_crit(2, n), ou_half_life(e), sqrt(ss / (n - 2)), n, lags)
 end

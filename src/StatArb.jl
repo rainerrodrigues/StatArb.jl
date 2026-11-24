@@ -26,11 +26,14 @@ include("execution.jl")
 include("screening.jl")
 include("selection.jl")
 include("portfolio.jl")
+include("strategy.jl")
 include("backtest.jl")
+include("rules.jl")
 include("validate.jl")
 include("metrics.jl")
 include("synthetic.jl")
 include("stress.jl")
+include("export.jl")
 
 """
     load_panel_arrow(path; bars_per_year=252, spread_bps=5, depth_frac=0.01, missing_policy=:error) -> PricePanel
@@ -59,25 +62,31 @@ export OLSWorkspace, ols!, ols_line, ADFResult, adf!, adf_auto!, mackinnon_crit,
 export KalmanConfig, KalmanHedge, kalman_step, kalman_update!, calibrate_kalman, kalman_filter,
        hedge_ratio, intercept, size_multiplier, autocor_lag, ljung_box,
        OUKalmanHedge, ou_kalman_step, calibrate_ou_kalman, calibrate_filter, innovation_z,
-       filtered_spread, model_half_life, ar1_fit, ou_noise_fit, recalibrate!
+       filtered_spread, model_half_life, ar1_fit, ou_noise_fit, recalibrate!,
+       BasketFilter, basket_kalman_step, calibrate_basket_filter, spread_scale
 # execution
 export ExecConfig, ExecutionSimulator, Book, Order, FillRecord, OrderKind, MARKET, LIMIT,
-       submit_pair!, process_orders!, accrue_financing!, apply_corporate_actions!, update_vol!, pending_qty, cancel_pair!,
+       submit_pair!, submit_ticket!, process_orders!, accrue_financing!, apply_corporate_actions!, update_vol!, pending_qty, cancel_pair!,
        equity, gross_exposure
 # screening / health / parallel
 export distance_screen, test_pairs, PairTest, scan_johansen, rolling_johansen, with_single_threaded_blas,
        HealthState, ACTIVE, QUARANTINE, RETIRED, HealthGateConfig, healthy, gate_transition,
        NullDistribution, null_pvalue, eg_null_distribution, johansen_null_distribution,
-       benjamini_hochberg, pair_pvalues
+       benjamini_hochberg, pair_pvalues, adf_null_distribution, adf_pvalue,
+       eg_null_distribution_single, eg_pvalue, johansen_pvalue, basket_candidates
 # portfolio / backtest
 export RiskConfig, OverlayWorkspace, overlay_weights!, leg_shares,
-       BacktestConfig, BacktestResult, FormationRecord, run_backtest, with, validate_config
+       BacktestConfig, BacktestResult, FormationRecord, HealthRecord, run_backtest, reconfigure, with,
+       validate_config, SpreadState, nlegs, ispair, zscore, isopen, SignalContext,
+       AbstractSignalRule, ZScoreBands, CostAwareBands, update_signal!, round_trip_cost, cost_aware_entry,
+       AbstractAllocator, DefaultAllocator, EqualWeightAllocator, target_weights!
 # metrics
 export performance, factor_attribution, panel_factors, health_telemetry, cost_breakdown, report, sparkline
 # synthetic / stress
 export simulate_ou_pair, simulate_vecm, synthetic_universe, recovery_study,
        sensitivity_sweep, misspecification_asymmetry, print_sweep
 # io
-export load_panel_arrow, save_panel_arrow
+export load_panel_arrow, save_panel_arrow, write_csv, result_tables, export_results,
+       plot_backtest, plot_health, plot_sweep
 
 end # module

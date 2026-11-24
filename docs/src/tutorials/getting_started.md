@@ -64,7 +64,7 @@ a limit order fills only when the price trades through it, which is exactly when
 has moved against you.
 
 ```@example gs
-resp = run_backtest(panel, with(cfg; exec = ExecConfig(style = :passive)))
+resp = run_backtest(panel, reconfigure(cfg; exec = ExecConfig(style = :passive)))
 cost_breakdown(resp)
 ```
 

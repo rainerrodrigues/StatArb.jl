@@ -82,6 +82,24 @@ jobs:
           julia --project benchmark/validation.jl | tee validation.md
           { echo '### Statistical validation'; cat validation.md; } >> "$GITHUB_STEP_SUMMARY"
 
+  plotting:
+    # Renders every plot of the Makie extension with CairoMakie (kept out of the main
+    # test target so the core test matrix stays light)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Plotting extension
+        run: |
+          julia -e '
+            using Pkg
+            Pkg.activate(temp = true)
+            Pkg.develop(path = pwd()); Pkg.add("CairoMakie")
+            include("test/plotting.jl")'
+
   jet:
     # Static analysis: fails when JET finds possible errors (undefined names,
     # calls that can't dispatch, nothing-related mistakes). Pinned to 1.12

@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Strategy, baskets and tooling
+
+- **Basket trading**: `max_baskets`, `basket_size` (3–5), `basket_screen_top` and
+  `min_basket_weight`. Formation grows screened pairs into baskets
+  (`basket_candidates`), tests them with the `k`-asset Johansen test (exact p-values,
+  Benjamini-Hochberg), and rejects pairs in disguise. Baskets trade with fixed Johansen
+  weights, a two-state `BasketFilter` (~47 ns per update, zero allocations) and
+  `k`-asset health checks. `synthetic_universe(...; n_baskets)` plants baskets for
+  validation.
+- **Pluggable strategy components**: `run_backtest` now runs as stages over a
+  `BacktestState`, dispatching on `AbstractSignalRule` (`ZScoreBands`, `CostAwareBands`)
+  and `AbstractAllocator` (`DefaultAllocator`, `EqualWeightAllocator`). Implement
+  `update_signal!` or `target_weights!` for your own. `PairState` is replaced by
+  `SpreadState` (k legs, log-price weights). The refactor reproduces the previous
+  release's equity curves bit for bit.
+- **Cost-aware entries**: `CostAwareBands(cost_multiple)` with `round_trip_cost` and
+  `cost_aware_entry`.
+- **Exact p-values**: `adf_pvalue`, `eg_pvalue`, `johansen_pvalue` and their cached null
+  distributions (`adf_null_distribution`, `eg_null_distribution_single`,
+  `johansen_null_distribution(T; k)`). `EGResult` now stores `lags`.
+- **Multi-leg execution**: `submit_ticket!` for any number of legs (`submit_pair!` is a
+  wrapper). Optional re-pegging of resting passive orders (`ExecConfig(reprice = true)`,
+  off by default: it increased legging on daily bars).
+- **Export and plotting**: `export_results` (CSV, or Arrow with `using Arrow`),
+  `result_tables` and `write_csv`; a Makie extension with `plot_backtest`, `plot_health`
+  and `plot_sweep`.
+- `with(cfg; …)` is renamed to `reconfigure(cfg; …)`, which also rejects unknown field
+  names. `with` is deprecated.
+- CI: a plotting job, and validation checks for basket precision and ADF p-value
+  calibration. Docs: tutorials on baskets and custom rules, and on plotting and export
+  (rendered with CairoMakie).
+
 ### Kalman filter
 
 - **OU-augmented Kalman filter (now the default, `KalmanConfig(model = :ou)`)**: the state

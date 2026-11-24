@@ -56,17 +56,26 @@ Panel of `2·n_pairs` cointegrated assets (pair `i` uses assets `2i-1` (y) and `
 Pairs are assigned their own sector; noise assets are spread across all sectors.
 `obs_noise` adds i.i.d. Gaussian noise of that standard deviation to every log price, which
 mimics bid-ask bounce and stale quotes (the spread dynamics are unchanged).
-`truth` lists `(y, x, beta, half_life)` for each planted pair.
+
+`n_baskets` plants three-asset baskets `y = α + b₁x₁ + b₂x₂ + s` (assets placed after the
+pairs, each basket in its own sector) with half-lives `basket_half_lives`; no pair inside
+a basket is cointegrated on its own.
+
+`truth` lists, for every planted spread, `(y, x, beta, half_life, assets, weights)`:
+`weights` are the log-price weights normalised to `weights[1] = 1` (`[1, −β]` for a pair,
+`[1, −b₁, −b₂]` for a basket, which has `beta = NaN`).
 """
 function synthetic_universe(rng::AbstractRNG; n_pairs::Int = 8, n_noise::Int = 8, T::Int = 1500,
                             half_lives = range(2.0, 12.0; length = n_pairs),
                             betas = range(0.7, 1.5; length = n_pairs),
                             sigma_x = 0.012, sigma_s = 0.006, market_vol = 0.006,
-                            spread_bps = 4.0, volume = 2e6, depth_frac = 0.02, obs_noise = 0.0)
-    n = 2n_pairs + n_noise
+                            spread_bps = 4.0, volume = 2e6, depth_frac = 0.02, obs_noise = 0.0,
+                            n_baskets::Int = 0, basket_half_lives = range(3.0, 8.0; length = n_baskets))
+    n = 2n_pairs + 3n_baskets + n_noise
     L = zeros(n, T)
     mkt = cumsum(market_vol .* randn(rng, T))
-    truth = NamedTuple{(:y, :x, :beta, :half_life),Tuple{Int,Int,Float64,Float64}}[]
+    truth = NamedTuple{(:y, :x, :beta, :half_life, :assets, :weights),
+                       Tuple{Int,Int,Float64,Float64,Vector{Int},Vector{Float64}}}[]
     sector = zeros(Int, n)
     for i in 1:n_pairs
         sim = simulate_ou_pair(rng, T; alpha = 0.1randn(rng), beta = betas[i], half_life = half_lives[i],
@@ -74,10 +83,29 @@ function synthetic_universe(rng::AbstractRNG; n_pairs::Int = 8, n_noise::Int = 8
         L[2i-1, :] = sim.y .+ betas[i] .* mkt
         L[2i, :] = sim.x .+ mkt
         sector[2i-1] = sector[2i] = i
-        push!(truth, (y = 2i - 1, x = 2i, beta = Float64(betas[i]), half_life = Float64(half_lives[i])))
+        push!(truth, (y = 2i - 1, x = 2i, beta = Float64(betas[i]), half_life = Float64(half_lives[i]),
+                      assets = [2i - 1, 2i], weights = [1.0, -Float64(betas[i])]))
+    end
+    for b in 1:n_baskets
+        a0 = 2n_pairs + 3(b - 1)
+        b1, b2 = 0.4 + 0.6rand(rng), 0.3 + 0.5rand(rng)
+        φ = 2.0^(-1.0 / basket_half_lives[b])
+        x1 = log(20 + 80rand(rng)) .+ cumsum(sigma_x .* randn(rng, T))
+        x2 = log(20 + 80rand(rng)) .+ cumsum(sigma_x .* randn(rng, T))
+        s = zeros(T)
+        s[1] = sigma_s / sqrt(1 - φ^2) * randn(rng)
+        for t in 2:T
+            s[t] = φ * s[t-1] + sigma_s * randn(rng)
+        end
+        L[a0+1, :] = 0.1randn(rng) .+ b1 .* x1 .+ b2 .* x2 .+ s .+ (b1 + b2) .* mkt
+        L[a0+2, :] = x1 .+ mkt
+        L[a0+3, :] = x2 .+ mkt
+        sector[a0+1:a0+3] .= n_pairs + b
+        push!(truth, (y = a0 + 1, x = a0 + 2, beta = NaN, half_life = Float64(basket_half_lives[b]),
+                      assets = [a0 + 1, a0 + 2, a0 + 3], weights = [1.0, -b1, -b2]))
     end
     for j in 1:n_noise
-        a = 2n_pairs + j
+        a = 2n_pairs + 3n_baskets + j
         L[a, :] = log(20 + 80rand(rng)) .+ cumsum(sigma_x .* randn(rng, T)) .+ mkt
         sector[a] = 1 + (j - 1) % max(n_pairs, 1)
     end

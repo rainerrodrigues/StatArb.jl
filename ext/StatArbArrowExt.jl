@@ -63,4 +63,9 @@ function StatArb.save_panel_arrow(path::AbstractString, p::PricePanel)
     path
 end
 
+# Arrow has no enum type: write enums (and symbols) by name, as the CSV export does
+_arrow_col(c::AbstractVector{<:Union{Enum,Symbol}}) = string.(c)
+_arrow_col(c::AbstractVector) = c
+StatArb._write_arrow_table(path::String, tab::NamedTuple) = (Arrow.write(path, map(_arrow_col, tab)); path)
+
 end # module

@@ -75,26 +75,101 @@ function eg_null_distribution(T::Integer; lags::Integer = 1, nsim::Integer = 10_
 end
 
 """
-    johansen_null_distribution(T; kdiff=1, nsim=10_000) -> NullDistribution
+    johansen_null_distribution(T; k=2, kdiff=1, nsim=10_000) -> NullDistribution
 
-Null distribution (two independent random walks) of the Johansen trace statistic for
+Null distribution (`k` independent random walks) of the Johansen trace statistic for
 rank 0, restricted constant, for windows of `T` bars. Cached; thread-safe.
 """
-function johansen_null_distribution(T::Integer; kdiff::Integer = 1, nsim::Integer = 10_000)
+function johansen_null_distribution(T::Integer; k::Integer = 2, kdiff::Integer = 1, nsim::Integer = 10_000)
     lock(_NULL_LOCK) do
-        get!(_NULL_CACHE, (2, Int(T), Int(kdiff), Int(nsim))) do
-            rng = Xoshiro(0x5eed_0002 + T)
-            ws = JohansenWorkspace(2, T; kdiff = kdiff)
-            X = zeros(2, T)
+        get!(_NULL_CACHE, (10 + Int(k), Int(T), Int(kdiff), Int(nsim))) do
+            rng = Xoshiro(0x5eed_0002 + T + 1000(k - 2))   # k = 2 keeps its original seed
+            ws = JohansenWorkspace(k, T; kdiff = kdiff)
+            X = zeros(k, T)
             stats = Vector{Float64}(undef, nsim)
             for i in 1:nsim
-                _random_walk!(rng, view(X, 1, :)); _random_walk!(rng, view(X, 2, :))
+                for r in 1:k
+                    _random_walk!(rng, view(X, r, :))
+                end
                 stats[i] = johansen!(ws, X).trace_r0
             end
             NullDistribution(stats, :upper)
         end
     end
 end
+
+"""
+    adf_null_distribution(n; lags=1, constant=true, nsim=10_000) -> NullDistribution
+
+Null distribution (a random walk of length `n`) of the ADF t-statistic computed by
+[`adf!`](@ref) with `lags` lagged differences, with or without a constant. Cached.
+"""
+function adf_null_distribution(n::Integer; lags::Integer = 1, constant::Bool = true, nsim::Integer = 10_000)
+    lock(_NULL_LOCK) do
+        get!(_NULL_CACHE, (constant ? 4 : 5, Int(n), Int(lags), Int(nsim))) do
+            rng = Xoshiro(0x5eed_0004 + n + 7constant)
+            ws = OLSWorkspace(n, lags + 2)
+            x = zeros(n)
+            stats = Vector{Float64}(undef, nsim)
+            for i in 1:nsim
+                _random_walk!(rng, x)
+                stats[i] = adf!(ws, x, Int(lags); constant = constant).stat
+            end
+            NullDistribution(stats, :lower)
+        end
+    end
+end
+
+"""
+    adf_pvalue(r::ADFResult; constant=true, nsim=10_000) -> Float64
+
+Exact finite-sample Monte Carlo p-value of an ADF result (the series length and lag order
+are taken from `r`; `constant` must match how the test was run).
+"""
+adf_pvalue(r::ADFResult; constant::Bool = true, nsim::Integer = 10_000) =
+    null_pvalue(adf_null_distribution(r.nobs + r.lags + 1; lags = r.lags, constant = constant, nsim = nsim), r.stat)
+
+"""
+    eg_null_distribution_single(n; lags=1, nsim=10_000) -> NullDistribution
+
+Null distribution of the one-orientation Engle-Granger statistic (`y` on `x`) for series
+of length `n`. Cached.
+"""
+function eg_null_distribution_single(n::Integer; lags::Integer = 1, nsim::Integer = 10_000)
+    lock(_NULL_LOCK) do
+        get!(_NULL_CACHE, (3, Int(n), Int(lags), Int(nsim))) do
+            rng = Xoshiro(0x5eed_0003 + n)
+            ws = EGWorkspace(n, lags)
+            y = zeros(n); x = zeros(n)
+            stats = Vector{Float64}(undef, nsim)
+            for i in 1:nsim
+                _random_walk!(rng, y); _random_walk!(rng, x)
+                stats[i] = engle_granger!(ws, y, x; lags = Int(lags)).adf
+            end
+            NullDistribution(stats, :lower)
+        end
+    end
+end
+
+"""
+    eg_pvalue(r::EGResult; nsim=10_000) -> Float64
+
+Exact finite-sample Monte Carlo p-value of a single Engle-Granger test (one orientation,
+the lag order stored in `r`). For the minimum over both orientations, which formation
+uses, see [`eg_null_distribution`](@ref).
+"""
+eg_pvalue(r::EGResult; nsim::Integer = 10_000) =
+    null_pvalue(eg_null_distribution_single(r.nobs; lags = r.lags, nsim = nsim), r.adf)
+
+"""
+    johansen_pvalue(r::JohansenResult; kdiff=1, nsim=10_000) -> Float64
+
+Monte Carlo p-value of the rank-0 trace statistic (restricted constant) for a Johansen
+result on a `k`-asset window; `kdiff` must match the test.
+"""
+johansen_pvalue(r::JohansenResult; kdiff::Integer = 1, nsim::Integer = 10_000) =
+    null_pvalue(johansen_null_distribution(r.nobs + kdiff + 1; k = length(r.basket), kdiff = kdiff, nsim = nsim),
+                r.trace[1])
 
 """
     benjamini_hochberg(p, q) -> BitVector

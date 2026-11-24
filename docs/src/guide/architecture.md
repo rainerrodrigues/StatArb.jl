@@ -6,11 +6,12 @@
 |---|---|---|
 | Data | `data.jl` | contiguous `n_assets × T` panels, mirrored ring buffers, the simulation clock |
 | Econometrics | `linalg.jl`, `adf.jl`, `johansen.jl`, `kalman.jl` | allocation-free statistics on rolling windows |
-| Selection & health | `screening.jl` | distance pre-screen, threaded scans, quarantine state machine |
-| Execution | `execution.jl` | order lifecycle, fills, costs, financing |
-| Portfolio | `portfolio.jl` | pair caps, leg split, cross-spread overlay |
-| Orchestration | `backtest.jl` | walk-forward event loop |
-| Reporting | `metrics.jl`, `stress.jl` | performance, attribution, telemetry, sweeps |
+| Selection & health | `screening.jl`, `selection.jl` | distance pre-screen, threaded scans, exact p-values, FDR control, quarantine state machine |
+| Execution | `execution.jl` | multi-leg order lifecycle, fills, costs, financing |
+| Portfolio | `portfolio.jl` | caps, leg split, cross-spread overlay |
+| Strategy | `strategy.jl`, `rules.jl` | pluggable signal rules and allocators |
+| Orchestration | `backtest.jl`, `validate.jl` | walk-forward event loop over pairs and baskets |
+| Reporting | `metrics.jl`, `stress.jl`, `export.jl` | performance, attribution, telemetry, sweeps, export; plots via the Makie extension |
 
 The econometric layers know nothing about orders, and the execution layer knows nothing
 about cointegration. They only meet inside the event loop.
@@ -18,19 +19,26 @@ about cointegration. They only meet inside the event loop.
 ## The event loop
 
 [`run_backtest`](@ref) moves a single monotonic [`Clock`](@ref) forward one bar at a time.
-At bar `t` it:
+Each bar runs a fixed sequence of stages over a `BacktestState`:
 
-1. accrues borrow fees and interest for the interval `(t−1, t]`, applies that bar's
-   corporate actions, then fills orders decided at or before `t − latency` using bar-`t`
-   quotes, volume and depth (halted bars don't fill);
-2. checks maintenance margin and liquidates if it's breached;
-3. every `trading` bars, re-runs formation on `[t−F+1, t]`: distance screen, then
-   Engle-Granger and Johansen, then pair selection, then Kalman calibration;
-4. for each pair, pushes bar `t` into its ring buffer, updates the Kalman filter and, every
-   `health_every` bars, runs the health checks;
-5. turns signals into target positions and submits orders, which become eligible from
-   `t + latency`;
-6. marks to market and records telemetry.
+| Stage | What happens at bar `t` |
+|---|---|
+| market | accrue borrow fees and interest for `(t−1, t]`, apply corporate actions, fill orders decided at or before `t − latency` on bar-`t` quotes, volume and depth (halted bars don't fill) |
+| formation | every `trading` bars, on `[t−F+1, t]`: distance screen, Engle-Granger and Johansen tests on pairs (and Johansen on baskets), FDR selection, filter calibration |
+| models | for every spread with a fresh quote: ring buffer, filter update and, every `health_every` bars, the health check |
+| risk | maintenance-margin check; liquidate and block entries if breached |
+| signals | the configured [`AbstractSignalRule`](@ref) |
+| allocate | the configured [`AbstractAllocator`](@ref), then the uncertainty throttle, the `max_gross` cap, and the leg split `wᵢ / Σ|w|` |
+| orders | rebalance-band-aware order generation (never above `max_gross`); orders become eligible from `t + latency` |
+| record | retire flat spreads that left the universe, mark to market, telemetry |
+
+A *spread* ([`SpreadState`](@ref)) is either a pair, whose hedge ratio comes from a
+Kalman filter, or a `k`-asset basket with Johansen weights. Every stage after formation
+handles both.
+
+The signal rule and allocator are fields of [`BacktestConfig`](@ref). `run_backtest` calls
+an inner function specialised on their concrete types, so custom components (see
+[Baskets and custom rules](@ref)) run with no dynamic dispatch.
 
 ## Guardrails against lookahead
 

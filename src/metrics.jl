@@ -169,6 +169,9 @@ function report(io::IO, res::BacktestResult; factors = nothing, factor_names = n
     end
     println(io, "   Formations: ", length(res.formations), "   pairs selected/formation: ",
             join([length(f.selected) for f in res.formations], " "))
+    if any(f -> f.n_basket_candidates > 0, res.formations)
+        println(io, "   Baskets selected/formation: ", join([length(f.baskets) for f in res.formations], " "))
+    end
     println(io, line)
     nothing
 end
