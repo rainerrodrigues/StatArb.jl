@@ -21,7 +21,8 @@ export_results("out", res)                    # CSV logs (or format = :arrow aft
 # using CairoMakie; plot_backtest(res)        # dashboard via the Makie extension
 ```
 
-Run with threads for parallel formation scans and sweeps: `julia --project=. -t auto`.
+Install from the General registry with `using Pkg; Pkg.add("StatArb")`. Run with threads for
+parallel formation scans and sweeps: `julia -t auto`.
 
 📖 **[Documentation](https://rainerrodrigues.github.io/StatArb.jl/dev/)**: tutorials, guides for
 each layer, and the full API.
@@ -36,7 +37,10 @@ each layer, and the full API.
 | `ci.yml` → `plotting` | renders every plot of the Makie extension with CairoMakie |
 | `ci.yml` → `jet` | JET static analysis of the whole package (pinned to Julia 1.12) |
 | `docs.yml` | builds the Documenter site, running every example, and deploys it to `gh-pages` |
-| `TagBot.yml`, `CompatHelper.yml` | release tagging and dependency compat bumps |
+| `ci.yml` → `lint` | the generic pre-commit checks (whitespace, line endings, YAML/TOML syntax, merge markers, large files) |
+| `TagBot.yml`, `CompatHelper.yml` | release tagging after registration, and `[compat]` bumps for Julia dependencies |
+| `dependabot.yml`, `dependabot-automerge.yml` | weekly grouped GitHub Actions updates; minor and patch bumps merge automatically once CI and Documentation pass |
+| `codeql.yml` | CodeQL security analysis of the workflows themselves |
 
 ## Layout
 

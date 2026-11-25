@@ -34,7 +34,7 @@ report(res)                       # performance + execution costs + model health
 
 ```julia
 using Pkg
-Pkg.add(url = "https://github.com/rainerrodrigues/StatArb.jl")
+Pkg.add("StatArb")
 ```
 
 Start Julia with threads (`julia -t auto`) so formation scans and sensitivity sweeps run in

@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 (2026-11-25)
+
+First registered release. The sections below record how the package was built up
+before registration; the foundations are listed at the end.
 
 ### Performance, memory and robustness
 
@@ -117,9 +120,7 @@ configurations).
 - `latest` on an empty ring buffer throws instead of reading stale memory.
 - Docstrings for every exported name.
 
-## v0.1.0 (2026-11-22)
-
-First version.
+### Foundations (2026-11-22)
 
 - Data layer: contiguous `n_assets × T` price panels, mirrored ring buffers
   that always expose the last `W` bars as one contiguous view, a monotonic
