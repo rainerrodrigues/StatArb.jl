@@ -202,7 +202,8 @@ end
 Output of [`run_backtest`](@ref): bar indices `t`, `timestamps`, `equity` and `returns`;
 columnar telemetry `bars`, `health` and `fills` (`StructVector`s, so they work with any
 Tables.jl consumer); `formations`; the final `book`; forced-liquidation bars
-`margin_calls`; and the config used.
+`margin_calls`; `(bar, spread id)` of every filter rebuilt after diverging
+(`model_resets`); and the config used.
 """
 struct BacktestResult
     config::BacktestConfig
@@ -216,6 +217,7 @@ struct BacktestResult
     formations::Vector{FormationRecord}
     book::Book
     margin_calls::Vector{Int}
+    model_resets::Vector{Tuple{Int,Int}}
     bars_per_year::Float64
     symbols::Vector{Symbol}
 end
@@ -254,6 +256,7 @@ mutable struct BacktestState
     jws::Dict{Int,JohansenWorkspace}       # health-check workspaces by basket size
     gate::HealthGateConfig
     ows::OverlayWorkspace
+    screen::ScreenWorkspace
     spreads::Vector{SpreadState}
     byid::Dict{Int,SpreadState}
     next_id::Int
@@ -261,6 +264,7 @@ mutable struct BacktestState
     bars::StructVector{BarRecord}
     formations::Vector{FormationRecord}
     margin_calls::Vector{Int}
+    model_resets::Vector{Tuple{Int,Int}}
     no_entry_until::Int
     liquidating::Bool
     open_sel::Vector{SpreadState}
@@ -276,84 +280,13 @@ function BacktestState(panel::PricePanel, cfg::BacktestConfig)
                   EGWorkspace(W, cfg.adf_lags), jws,
                   HealthGateConfig(cfg.hl_bounds, cfg.gate_on, cfg.recover_checks, cfg.coint_level),
                   OverlayWorkspace(2 * (cfg.max_pairs + cfg.max_baskets)),
+                  ScreenWorkspace(n, cfg.formation),
                   SpreadState[], Dict{Int,SpreadState}(), 1,
                   StructVector{HealthRecord}(undef, 0), StructVector{BarRecord}(undef, 0),
-                  FormationRecord[], Int[], 0, false, SpreadState[], Float64[], UInt8[])
+                  FormationRecord[], Int[], Tuple{Int,Int}[], 0, false, SpreadState[], Float64[], UInt8[])
 end
 
 # ─── formation ───────────────────────────────────────────────────────────────
-
-# z-normalised log prices over a window, one column per asset
-function _normalized_window(logp::AbstractMatrix, t::Int, W::Int)
-    n = size(logp, 1)
-    Z = Matrix{Float64}(undef, W, n)
-    for a in 1:n
-        μ = 0.0
-        for s in 1:W
-            μ += logp[a, t-W+s]
-        end
-        μ /= W
-        v = 0.0
-        for s in 1:W
-            d = logp[a, t-W+s] - μ
-            Z[s, a] = d
-            v += d * d
-        end
-        sd = sqrt(v / (W - 1))
-        @views Z[:, a] ./= (sd > 0 ? sd : 1.0)
-    end
-    Z
-end
-
-@inline function _ssd(Z::Matrix{Float64}, i::Int, j::Int)
-    d = 0.0
-    @inbounds @simd for s in 1:size(Z, 1)
-        d += (Z[s, i] - Z[s, j])^2
-    end
-    d
-end
-
-"""
-    basket_candidates(logp, pairs, t, W, k; top=50, sector=nothing, same_sector=true, eligible=nothing)
-
-Grow each screened pair into a `k`-asset basket by repeatedly adding the eligible asset
-with the smallest total normalised distance to the current members (within the sector
-if `same_sector`). Returns up to `top` distinct baskets (sorted asset lists), in the order
-of the pairs they grew from.
-"""
-function basket_candidates(logp::AbstractMatrix, pairs::AbstractVector{NTuple{2,Int}}, t::Integer, W::Integer,
-                           k::Integer; top::Integer = 50, sector = nothing, same_sector::Bool = true,
-                           eligible = nothing)
-    n = size(logp, 1)
-    Z = _normalized_window(logp, Int(t), Int(W))
-    seen = Set{Vector{Int}}()
-    out = Vector{Int}[]
-    for (i, j) in pairs
-        length(out) >= top && break
-        members = [i, j]
-        while length(members) < k
-            best, bestd = 0, Inf
-            for m in 1:n
-                m in members && continue
-                (eligible !== nothing && !eligible[m]) && continue
-                (same_sector && sector !== nothing && sector[m] != sector[i]) && continue
-                d = 0.0
-                for a in members
-                    d += _ssd(Z, m, a)
-                end
-                d < bestd && ((best, bestd) = (m, d))
-            end
-            best == 0 && break
-            push!(members, best)
-        end
-        length(members) == k || continue
-        key = sort(members)
-        key in seen && continue
-        push!(seen, key)
-        push!(out, key)
-    end
-    out
-end
 
 function _new_spread!(st::BacktestState, assets::Vector{Int}, weights::Vector{Float64}, model, t::Int, hl::Float64)
     cfg, logp = st.cfg, st.panel.logmid
@@ -399,8 +332,11 @@ function _warmup!(model, zr::MirroredRing, logp, assets, weights, rng)
     model
 end
 
-_ref_variance(m::Union{KalmanHedge,OUKalmanHedge}) = m.P[2, 2]
-_ref_variance(m::BasketFilter) = m.P[2, 2]
+# Var(β) for pair filters, Var(s) for the basket filter: both live at P[2, 2]
+_ref_variance(m) = m.P[2, 2]
+
+# a filter is usable only while its state, covariance and outputs are finite
+_model_finite(m) = isfinite(m.z) && m.S > 0 && all(isfinite, m.θ) && all(isfinite, m.P)
 
 @inline _filter_step!(m::Union{KalmanHedge,OUKalmanHedge}, logp, assets, weights, τ) =
     kalman_update!(m, logp[assets[1], τ], logp[assets[2], τ])
@@ -420,8 +356,8 @@ function _stage_formation!(st::BacktestState, t::Int)
     # assets with enough real (tradable) bars in the window and tradable right now
     eligible = [panel.tradable[a, t] && count(view(panel.tradable, a, t-F+1:t)) >= cfg.min_tradable_frac * F
                 for a in 1:nassets(panel)]
-    cands = distance_screen(logp, t, F; top = cfg.screen_top, sector = panel.sector,
-                            same_sector = cfg.same_sector_only, eligible = eligible)
+    cands = distance_screen!(st.screen, logp, t, F; top = cfg.screen_top, sector = panel.sector,
+                             same_sector = cfg.same_sector_only, eligible = eligible)
 
     # ── pairs: Engle-Granger + Johansen, FDR across candidates ──
     tests = test_pairs(logp, cands, t, F; adf_lags = cfg.adf_lags, kdiff = cfg.johansen_lags,
@@ -457,7 +393,7 @@ function _stage_formation!(st::BacktestState, t::Int)
     nbc = nbs = 0
     if cfg.max_baskets > 0
         k = cfg.basket_size
-        bc = basket_candidates(logp, cands, t, F, k; top = cfg.basket_screen_top, sector = panel.sector,
+        bc = basket_candidates(st.screen.Z, cands, k; top = cfg.basket_screen_top, sector = panel.sector,
                                same_sector = cfg.same_sector_only, eligible = eligible)
         nbc = length(bc)
         scans = scan_johansen(logp, bc, t, F; kdiff = cfg.johansen_lags, level = cfg.coint_level,
@@ -528,10 +464,36 @@ function _update_spread!(st::BacktestState, sp::SpreadState, t::Int)
     end
     push_column!(sp.ring, logp, sp.assets, t)
     _filter_step!(sp.model, logp, sp.assets, sp.weights, t)
+    _model_finite(sp.model) || _reset_model!(st, sp, t)
     ispair(sp) && (sp.weights[2] = -hedge_ratio(sp.model))
     push!(sp.zring, innovation_z(sp.model))
     push!(sp.rring, r / wsum)
     (t - sp.created_t) % cfg.health_every == 0 && _health_check!(st, sp, t)
+    nothing
+end
+
+# A diverged filter (non-finite state or outputs) is rebuilt from the spread's own rolling
+# window (data up to t only) and the spread is quarantined until it passes its health
+# checks again. If even the rebuilt filter is unusable the spread becomes close-only.
+function _reset_model!(st::BacktestState, sp::SpreadState, t::Int)
+    cfg = st.cfg
+    if ispair(sp)
+        sp.model = calibrate_filter(window(sp.ring, 1), window(sp.ring, 2), cfg.kalman; warmup = true)
+    else
+        buf = sp.spbuf
+        for s in eachindex(buf)
+            v = 0.0
+            for l in 1:nlegs(sp)
+                v += sp.weights[l] * window(sp.ring, l)[s]
+            end
+            buf[s] = v
+        end
+        sp.model = calibrate_basket_filter(buf, cfg.kalman; warmup = true)
+    end
+    sp.state = QUARANTINE
+    sp.good = 0
+    _model_finite(sp.model) || (sp.in_universe = false)
+    push!(st.model_resets, (t, sp.id))
     nothing
 end
 
@@ -777,5 +739,5 @@ function _run_backtest(panel::PricePanel, cfg::BacktestConfig, rule::R, alloc::A
     end
     rets = [eq[k] / eq[k-1] - 1 for k in 2:length(eq)]
     BacktestResult(cfg, collect(ts), panel.timestamps[ts], eq, rets, st.bars, st.health, st.sim.fills,
-                   st.formations, st.book, st.margin_calls, panel.bars_per_year, panel.symbols)
+                   st.formations, st.book, st.margin_calls, st.model_resets, panel.bars_per_year, panel.symbols)
 end

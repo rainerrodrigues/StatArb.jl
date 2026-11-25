@@ -38,7 +38,8 @@ Execution and financing assumptions.
   Sharpe than crossing after one bar.
 - `max_participation`: max fraction of bar volume per fill; `depth_levels`: max multiple of
   displayed touch size that may be consumed per bar
-- `impact_coef` η of the square-root law `Δp/p = η σ_bar √(q/V)`
+- `impact_coef` η of the square-root law `Δp/p = η σ_bar √(q/V)`; `max_impact` caps the
+  relative impact so that a pathological order can never produce a non-positive price
 - `commission_bps`, `commission_per_share`
 - `borrow_rate` (annual, on short market value; `borrow_rates` per-asset override),
   `margin_rate` (annual, on debit balances), `cash_rate` (annual, on free credit; short
@@ -53,6 +54,7 @@ Base.@kwdef struct ExecConfig
     max_participation::Float64 = 0.10
     depth_levels::Float64 = 5.0
     impact_coef::Float64 = 0.5
+    max_impact::Float64 = 0.5
     commission_bps::Float64 = 0.5
     commission_per_share::Float64 = 0.0
     borrow_rate::Float64 = 0.005
@@ -226,7 +228,7 @@ function process_orders!(on_fill::F, sim::ExecutionSimulator, book::Book, p::Pri
         filled = false
         if q > 0
             if o.kind == MARKET
-                imp = cfg.impact_coef * sqrt(sim.sigma2[a]) * sqrt(q / V)
+                imp = min(cfg.impact_coef * sqrt(sim.sigma2[a]) * sqrt(q / V), cfg.max_impact)
                 price = m + sgn * (h + m * imp)
                 _book_fill!(sim, book, o, t, sgn * q, price, m, q * h, q * m * imp, false)
                 filled = true

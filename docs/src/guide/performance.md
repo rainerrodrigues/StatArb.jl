@@ -13,9 +13,53 @@
 | Engle-Granger, W = 250 | ~2.2 µs | 0 |
 | Johansen, k = 2, W = 250 | ~10 µs | 0 |
 | Johansen, k = 3, W = 250 | ~14 µs | 0 |
-| Full walk-forward, 30 assets × 2000 bars | ~40 ms | — |
+| Full walk-forward, 30 assets × 2000 bars | ~27 ms | — |
+
+At a larger scale (270 assets × 2,500 bars, 20 pairs and 5 baskets, formation threading
+off):
+
+| | Time | Allocated |
+|---|---|---|
+| Build the panel (all fields supplied) | 19 ms | 26 MiB (= the panel itself) |
+| Backtest, same-sector screen | 190 ms | 12.7 MiB |
+| Backtest, screen across all pairs | 236 ms | 12.6 MiB |
+| Distance screen, 1,500 assets (1.1M pairs) | 18 ms | 8.7 MiB |
+
+## Memory model
+
+- **Panel.** A [`PricePanel`](@ref) holds five `n_assets × T` `Float64` matrices (mid,
+  log mid, spread, volume, depth) plus a `BitMatrix` of tradable bars, so about
+  `41·n·T` bytes. The constructor converts each input in one pass and only builds a
+  default matrix for a field you leave out.
+- **Live state.** Each spread holds `k × 2W` doubles for its mirrored ring buffer, two
+  short rings and a 2×2 or 3×3 filter state. All per-check statistics run in shared
+  workspaces.
+- **Formation.** [`distance_screen!`](@ref) runs on a reusable [`ScreenWorkspace`](@ref):
+  the normalised window (`W × n`), one Gram block (`n × 256`) and a heap of `top`
+  candidates. It never builds the `n²/2` list of pairs. Basket candidates reuse the same
+  normalised window.
+- **Results.** Telemetry is stored as `StructVector`s of small immutable records, so each
+  column is one contiguous vector.
+
+## Where the time goes
+
+On the 270-asset run, formation takes about 55% of the time (pair tests, basket scans and
+the screen) and the rolling health checks about 40%. Formation runs threaded by default.
+The health checks are exact recomputations of Engle-Granger and Johansen on the rolling
+window, about 2 µs and 10 µs each. They are deliberately not replaced by incremental
+moment updates, which would trade exactness for speed.
 
 CI runs the benchmark on every push and posts the results in the job summary.
+
+## Robustness guards on the hot path
+
+- A filter whose state, covariance or outputs become non-finite is rebuilt from the
+  spread's own rolling window, and the spread is quarantined. Every rebuild is logged in
+  `res.model_resets`.
+- Square-root impact is capped at `exec.max_impact` (50% by default), so no fill can have
+  a non-positive price.
+- BLAS's global thread setting is saved and restored once across nested or concurrent
+  threaded scans.
 
 ## How the kernels avoid allocating
 

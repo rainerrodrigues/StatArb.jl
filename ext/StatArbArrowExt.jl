@@ -32,8 +32,11 @@ function StatArb.load_panel_arrow(path::AbstractString; bars_per_year::Real = 25
     grab(c) = c in cols ? fill(NaN, n, T) : nothing
     M = fill(NaN, n, T); SP = grab(:spread); V = grab(:volume); D = grab(:depth)
     sector = ones(Int, n)
+    seen = falses(n, T)
     for r in eachindex(sy)
         i = si[sy[r]]; j = ti[ts[r]]
+        seen[i, j] && throw(ArgumentError("duplicate row for ($(sy[r]), $(ts[r]))"))
+        seen[i, j] = true
         M[i, j] = tbl.mid[r]
         SP === nothing || (SP[i, j] = tbl.spread[r])
         V === nothing || (V[i, j] = tbl.volume[r])

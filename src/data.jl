@@ -62,6 +62,17 @@ end
 
 _tofloat(x) = x === missing ? NaN : Float64(x)
 
+# one-pass conversion to a fresh Matrix{Float64} (`missing` → NaN), checking the shape
+function _float_matrix(x::AbstractMatrix, n::Int, T::Int, name::AbstractString)
+    size(x) == (n, T) || throw(DimensionMismatch("$name must be $n × $T, got $(size(x))"))
+    x isa Matrix{Float64} && return copy(x)
+    A = Matrix{Float64}(undef, n, T)
+    @inbounds for j in 1:T, i in 1:n
+        A[i, j] = _tofloat(x[i, j])
+    end
+    A
+end
+
 """
     PricePanel(mid; symbols, timestamps, spread, spread_bps=5, volume, default_volume=1e6,
                depth, depth_frac=0.01, sector, bars_per_year=252,
@@ -93,6 +104,7 @@ function PricePanel(mid::AbstractMatrix;
     n, T = size(mid)
     n >= 1 && T >= 1 || throw(ArgumentError("panel must have at least one asset and one bar"))
     length(symbols) == n || throw(DimensionMismatch("symbols"))
+    allunique(symbols) || throw(ArgumentError("symbols must be unique"))
     length(timestamps) == T || throw(DimensionMismatch("timestamps"))
     length(sector) == n || throw(DimensionMismatch("sector"))
     bars_per_year > 0 || throw(ArgumentError("bars_per_year must be positive"))
@@ -101,11 +113,12 @@ function PricePanel(mid::AbstractMatrix;
         timestamps[i] > timestamps[i-1] ||
             throw(ArgumentError("timestamps must be strictly increasing (violation at index $i)"))
     end
-    m = Matrix{Float64}(undef, n, T)
-    for j in 1:T, i in 1:n
-        m[i, j] = _tofloat(mid[i, j])
+    m = _float_matrix(mid, n, T, "mid")
+    bad = BitMatrix(undef, n, T)
+    @inbounds for j in 1:T, i in 1:n
+        x = m[i, j]
+        bad[i, j] = !(isfinite(x) && x > 0)
     end
-    bad = .!(isfinite.(m) .& (m .> 0))
     if any(bad)
         if missing_policy === :error
             I = findfirst(bad)::CartesianIndex{2}       # non-empty: we are inside any(bad)
@@ -121,14 +134,10 @@ function PricePanel(mid::AbstractMatrix;
             end
         end
     end
-    fill_matrix(x, default, nm) = begin
-        A = x === nothing ? default : Matrix{Float64}(_tofloat.(x))
-        size(A) == (n, T) || throw(DimensionMismatch(nm))
-        A
-    end
-    sp = fill_matrix(spread, m .* (spread_bps / 1e4), "spread")
-    vol = fill_matrix(volume, fill(Float64(default_volume), n, T), "volume")
-    dep = fill_matrix(depth, vol .* depth_frac, "depth")
+    # defaults are only materialised when a field isn't supplied
+    sp = spread === nothing ? m .* (spread_bps / 1e4) : _float_matrix(spread, n, T, "spread")
+    vol = volume === nothing ? fill(Float64(default_volume), n, T) : _float_matrix(volume, n, T, "volume")
+    dep = depth === nothing ? vol .* depth_frac : _float_matrix(depth, n, T, "depth")
     for j in 1:T, i in 1:n          # gaps: keep the panel finite, make the bar untradable
         if bad[i, j]
             isfinite(sp[i, j]) && sp[i, j] >= 0 || (sp[i, j] = m[i, j] * spread_bps / 1e4)
@@ -139,7 +148,7 @@ function PricePanel(mid::AbstractMatrix;
     for (nm, A) in (("spread", sp), ("volume", vol), ("depth", dep))
         all(x -> isfinite(x) && x >= 0, A) || throw(ArgumentError("$nm must be finite and non-negative"))
     end
-    tr = BitMatrix(.!bad .& (vol .> 0))
+    tr = .!bad .& (vol .> 0)                    # fused broadcast: already a BitMatrix
     if tradable !== nothing
         size(tradable) == (n, T) || throw(DimensionMismatch("tradable"))
         tr .&= Bool.(tradable)

@@ -699,6 +699,87 @@ end
     @test_throws DimensionMismatch write_csv(joinpath(dir, "bad.csv"), (a = [1], b = [1, 2]))
 end
 
+@testset "memory-bounded distance screen" begin
+    rng = Xoshiro(91)
+    n, T, W = 60, 400, 200
+    logp = cumsum(0.01 .* randn(rng, n, T); dims = 2)
+    sector = rand(rng, 1:4, n)
+    elig = rand(rng, n) .> 0.15
+    # brute force: every admissible pair, exact SSD, sorted
+    function brute(top, sector, same, elig)
+        Z = normalized_window!(zeros(W, n), logp, 350, W)
+        c = Tuple{Float64,Int,Int}[]
+        for i in 1:n-1, j in i+1:n
+            (same && sector !== nothing && sector[i] != sector[j]) && continue
+            (elig !== nothing && !(elig[i] && elig[j])) && continue
+            push!(c, (sum(abs2, Z[:, i] .- Z[:, j]), i, j))
+        end
+        [(i, j) for (_, i, j) in sort(c)[1:min(top, end)]]
+    end
+    ws = ScreenWorkspace(n, W; block = 7)                      # tiny block: many Gram blocks
+    for (top, sec, same, el) in ((25, nothing, false, nothing), (25, sector, true, nothing),
+                                 (40, sector, true, elig), (10_000, nothing, false, elig), (0, nothing, false, nothing))
+        got = distance_screen!(ws, logp, 350, W; top = top, sector = sec, same_sector = same, eligible = el)
+        @test got == brute(top, sec, same, el)
+        @test got == distance_screen(logp, 350, W; top = top, sector = sec, same_sector = same, eligible = el)
+    end
+    # the normalised window is left in the workspace and reused for baskets
+    c = distance_screen!(ws, logp, 350, W; top = 20, same_sector = false)
+    @test basket_candidates(ws.Z, c, 3; top = 10) == basket_candidates(logp, c, 350, W, 3; top = 10)
+    # memory does not scale with the number of pairs
+    big = cumsum(0.01 .* randn(rng, 1200, 300); dims = 2)
+    distance_screen(big, 300, 252; top = 50, same_sector = false)
+    @test (@allocated distance_screen(big, 300, 252; top = 50, same_sector = false)) < 10 * 2^20
+end
+
+@testset "robustness guards" begin
+    # duplicate symbols
+    @test_throws ArgumentError PricePanel(ones(2, 5); symbols = [:A, :A])
+    # supplied fields are used as given; defaults only when absent
+    sp = fill(0.02, 2, 5)
+    p = PricePanel(fill(10.0, 2, 5); spread = sp, volume = fill(5.0, 2, 5))
+    @test p.spread == sp && p.spread !== sp && p.depth == fill(0.05, 2, 5)
+    @test PricePanel(fill(10.0, 2, 5)).spread == fill(10.0 * 5 / 1e4, 2, 5)
+    @test_throws DimensionMismatch PricePanel(fill(10.0, 2, 5); volume = ones(2, 4))
+    # impact cap: an absurd order can't produce a non-positive price
+    pp = PricePanel(fill(10.0, 1, 4); volume = fill(10.0, 1, 4), depth = fill(1e9, 1, 4))
+    sim = ExecutionSimulator(ExecConfig(impact_coef = 1e6, max_participation = 1.0, commission_bps = 0.0), 1)
+    sim.sigma2 .= 0.04
+    book = Book(1e6, 1)
+    submit_ticket!(sim, pp, 1, [1], [-10.0], 1)
+    process_orders!((a...) -> nothing, sim, book, pp, 2)
+    @test 0 < sim.fills[1].price < 10.0
+    @test sim.fills[1].price ≈ 10.0 - 0.5 * 10.0 * 5 / 1e4 - 10.0 * 0.5
+    @test_throws ArgumentError validate_config(BacktestConfig(exec = ExecConfig(max_impact = 1.0)))
+    # BLAS thread count survives nested and concurrent single-threaded sections
+    n0 = BLAS.get_num_threads()
+    with_single_threaded_blas() do
+        with_single_threaded_blas(() -> @test(BLAS.get_num_threads() == 1))
+        @test BLAS.get_num_threads() == 1
+    end
+    @test BLAS.get_num_threads() == n0
+    # a diverged filter is rebuilt from its window and the spread is quarantined
+    panel, _ = synthetic_universe(Xoshiro(92); T = 700)
+    cfg = BacktestConfig()
+    st = StatArb.BacktestState(panel, cfg)
+    F = cfg.formation
+    tick!(st.clock, F); StatArb._stage_market!(st, F); StatArb._stage_formation!(st, F)
+    sp = st.spreads[1]
+    sp.model.P = sp.model.P * NaN
+    tick!(st.clock, F + 1)
+    StatArb._update_spread!(st, sp, F + 1)
+    @test StatArb._model_finite(sp.model)
+    @test sp.state == QUARANTINE && st.model_resets == [(F + 1, sp.id)]
+    @test isfinite(sp.weights[2])
+    @test isempty(run_backtest(panel, cfg).model_resets)                # healthy data: no resets
+    # telemetry grouping agrees with a naive computation
+    res = run_backtest(panel, cfg)
+    h = res.health
+    tel = health_telemetry(res)
+    @test tel.trace_trajectory[1] == sort(unique(h.t))
+    @test tel.trace_trajectory[2] == [median(h.trace_r0[h.t .== t]) for t in sort(unique(h.t))]
+end
+
 @testset "synthetic ground truth recovery" begin
     st = recovery_study(Xoshiro(8); nsim = 200, T = 500, beta = 1.2, half_life = 8.0)
     @test st.beta_eg.mean ≈ 1.2 atol = 0.02
@@ -734,6 +815,9 @@ end
     Arrow.write(gpath, (timestamp = [DateTime(2020, 1, d) for d in (1, 2, 3, 1, 3)],
                         symbol = ["A", "A", "A", "B", "B"], mid = [10.0, 11.0, 12.0, 20.0, 21.0]))
     @test_throws ArgumentError load_panel_arrow(gpath)
+    dpath = tempname() * ".arrow"
+    Arrow.write(dpath, (timestamp = [DateTime(2020, 1, 1), DateTime(2020, 1, 1)], symbol = ["A", "A"], mid = [1.0, 2.0]))
+    @test_throws ArgumentError load_panel_arrow(dpath)               # duplicate (symbol, timestamp)
     pg = load_panel_arrow(gpath; missing_policy = :ffill)
     @test pg.mid[2, :] == [20.0, 20.0, 21.0] && !pg.tradable[2, 2]
     # result export in Arrow format through the extension

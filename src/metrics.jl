@@ -63,17 +63,34 @@ externally sourced Fama-French factors for a full attribution.
 function panel_factors(p::PricePanel, trange::AbstractVector{<:Integer})
     n = nassets(p)
     F = zeros(length(trange), 2)
+    r = zeros(n); rp = zeros(n); wts = zeros(n)          # reused across bars
     for (k, t) in enumerate(trange)
         t >= 3 || continue
-        r = [p.mid[a, t] / p.mid[a, t-1] - 1 for a in 1:n]
-        rp = [p.mid[a, t-1] / p.mid[a, t-2] - 1 for a in 1:n]
+        @inbounds for a in 1:n
+            r[a] = p.mid[a, t] / p.mid[a, t-1] - 1
+            rp[a] = p.mid[a, t-1] / p.mid[a, t-2] - 1
+        end
         F[k, 1] = mean(r)
         μp = mean(rp)
-        wts = -(rp .- μp)
+        @. wts = -(rp - μp)
         s = sum(abs, wts)
-        F[k, 2] = s > 0 ? sum(wts .* r) / (s / 2) : 0.0
+        F[k, 2] = s > 0 ? sum(i -> wts[i] * r[i], 1:n) / (s / 2) : 0.0
     end
     F, ["MKT", "STR"]
+end
+
+# call f(key, indices) for every distinct key, in key order; indices keep their original order
+function _foreach_group(f, keys::AbstractVector)
+    ord = sortperm(keys; alg = Base.Sort.DEFAULT_STABLE)
+    i = 1
+    while i <= length(ord)
+        j = i
+        while j < length(ord) && keys[ord[j+1]] == keys[ord[i]]
+            j += 1
+        end
+        f(keys[ord[i]], view(ord, i:j))
+        i = j + 1
+    end
 end
 
 """
@@ -91,11 +108,15 @@ function health_telemetry(res::BacktestResult)
     h = res.health
     isempty(h) && return (coint_survival = NaN, rank_survival = NaN, trace_trajectory = (Int[], Float64[]),
                           half_life_cv = NaN, innov_acf1 = NaN, quarantine_rate = NaN, n_checks = 0)
-    ts = sort(unique(h.t))
-    med = [median(h.trace_r0[h.t .== t]) for t in ts]
+    # group by bar / by spread with one stable sort each (linear scans per group would be
+    # quadratic in the number of health checks)
+    ts = Int[]; med = Float64[]
+    _foreach_group(h.t) do t, idx
+        push!(ts, t); push!(med, median(view(h.trace_r0, idx)))
+    end
     cvs = Float64[]
-    for pid in unique(h.pair)
-        hl = filter(isfinite, h.half_life[h.pair .== pid])
+    _foreach_group(h.pair) do _, idx
+        hl = filter(isfinite, view(h.half_life, idx))
         length(hl) >= 3 && push!(cvs, std(hl) / mean(hl))
     end
     acf = filter(isfinite, h.innov_acf1)

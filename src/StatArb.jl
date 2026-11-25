@@ -24,6 +24,7 @@ include("johansen.jl")
 include("kalman.jl")
 include("execution.jl")
 include("screening.jl")
+include("health.jl")
 include("selection.jl")
 include("portfolio.jl")
 include("strategy.jl")
@@ -69,7 +70,7 @@ export ExecConfig, ExecutionSimulator, Book, Order, FillRecord, OrderKind, MARKE
        submit_pair!, submit_ticket!, process_orders!, accrue_financing!, apply_corporate_actions!, update_vol!, pending_qty, cancel_pair!,
        equity, gross_exposure
 # screening / health / parallel
-export distance_screen, test_pairs, PairTest, scan_johansen, rolling_johansen, with_single_threaded_blas,
+export distance_screen, distance_screen!, ScreenWorkspace, normalized_window!, test_pairs, PairTest, scan_johansen, rolling_johansen, with_single_threaded_blas,
        HealthState, ACTIVE, QUARANTINE, RETIRED, HealthGateConfig, healthy, gate_transition,
        NullDistribution, null_pvalue, eg_null_distribution, johansen_null_distribution,
        benjamini_hochberg, pair_pvalues, adf_null_distribution, adf_pvalue,

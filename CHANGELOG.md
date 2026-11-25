@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Performance, memory and robustness
+
+All of the performance changes are verified bit for bit against the previous commit
+(equity, every fill, every formation's selections and the telemetry, across five
+configurations).
+
+- **Distance screen**: rewritten around a reusable `ScreenWorkspace`. Distances come
+  from BLAS Gram blocks and stream through a bounded heap, then the survivors are re-ranked
+  by exact distance. Memory no longer grows with the `n²/2` pairs: 1,500 assets take
+  18 ms and 8.7 MiB, against 80 ms and 105 MiB before. New: `distance_screen!`,
+  `ScreenWorkspace`, `normalized_window!`. Basket candidates reuse the screen's
+  normalised window.
+- **Backtest memory**: 270 assets × 2,500 bars now allocate 12.7 MiB in total, against
+  51 MiB before (138 MiB → 12.6 MiB when screening across all pairs). Run time is 16–26%
+  lower.
+- **Panel construction**: inputs are converted in one pass, and default spread, volume
+  and depth matrices are only built when the field is missing. It now allocates exactly
+  the panel's own size (57 → 26 MiB) and is about 1.8× faster.
+- **Telemetry**: `health_telemetry` groups with one stable sort instead of linear scans,
+  which were quadratic in the number of health checks. `panel_factors` reuses buffers.
+- **Robustness**: diverged filters are rebuilt from their rolling window and the spread
+  is quarantined (`res.model_resets`); impact is capped by `ExecConfig(max_impact = 0.5)`;
+  duplicate symbols are rejected, as are duplicate `(symbol, timestamp)` rows in Arrow
+  input; BLAS thread-count save/restore is safe under nesting and concurrency.
+- **Cleanup**: the health gate moved to `health.jl`; the duplicated normalisation and
+  distance code is merged into the screening module.
+
 ### Strategy, baskets and tooling
 
 - **Basket trading**: `max_baskets`, `basket_size` (3–5), `basket_screen_top` and

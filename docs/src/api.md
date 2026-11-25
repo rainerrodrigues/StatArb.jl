@@ -46,7 +46,7 @@ Pages = ["execution.jl"]
 
 ```@autodocs
 Modules = [StatArb]
-Pages = ["screening.jl"]
+Pages = ["screening.jl", "health.jl"]
 ```
 
 ## Selection with false-discovery control
