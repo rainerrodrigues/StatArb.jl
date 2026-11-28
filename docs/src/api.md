@@ -91,6 +91,13 @@ Modules = [StatArb]
 Pages = ["metrics.jl"]
 ```
 
+## Structural-break monitoring
+
+```@autodocs
+Modules = [StatArb]
+Pages = ["breaks.jl"]
+```
+
 ## Overfitting statistics
 
 ```@autodocs

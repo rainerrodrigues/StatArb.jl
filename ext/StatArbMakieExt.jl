@@ -82,6 +82,7 @@ function StatArb.plot_health(res::BacktestResult, id::Integer; size = (1000, 800
     ax1 = Axis(fig[1, 1]; title = "Spread $id ($(k) assets: $(join(_assets(res, id), ", "))) — Johansen trace",
                ylabel = "trace(r = 0)")
     shade!(ax1)
+    alarms = res.breaks.t[res.breaks.pair .== id]
     lines!(ax1, t, h.trace_r0[idx]; color = BLUE)
     hlines!(ax1, [johansen_trace_cv(k)]; color = RED, linestyle = :dash)
     ax2 = Axis(fig[2, 1]; title = "Half-life (bars)", ylabel = "bars")
@@ -94,6 +95,9 @@ function StatArb.plot_health(res::BacktestResult, id::Integer; size = (1000, 800
     shade!(ax3)
     lines!(ax3, t, h.innov_acf1[idx]; color = BLUE)
     hlines!(ax3, [0.0]; color = GREY)
+    for ax in (ax1, ax2, ax3)
+        isempty(alarms) || vlines!(ax, alarms; color = RED, linestyle = :dot, linewidth = 2)
+    end
     linkxaxes!(ax1, ax2, ax3)
     fig
 end

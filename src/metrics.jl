@@ -182,6 +182,12 @@ function report(io::IO, res::BacktestResult; factors = nothing, factor_names = n
             c.spread, c.spread_bps, c.impact, c.impact_bps, c.commission, c.commission_bps)
     @printf(io, "   Borrow fees %10.0f   Net interest %10.0f   Net dividends %10.0f\n",
             c.borrow, c.interest_net, c.dividends_net)
+    if !isempty(res.breaks)
+        b = res.breaks
+        @printf(io, "   Structural breaks: %d alarms on %d spreads (mean ↑ %d, mean ↓ %d, variance %d)\n",
+                length(b), length(unique(b.pair)), count(==(:mean_up), b.kind), count(==(:mean_down), b.kind),
+                count(==(:variance), b.kind))
+    end
     isempty(res.margin_calls) ||
         println(io, "   ⚠ Margin calls (forced liquidation) at bars: ", join(res.margin_calls, ", "))
     println(io, " MODEL HEALTH")

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Structural-break monitoring (opt-in)
+
+- `BreakMonitorConfig(enabled = true)`: online two-sided CUSUM (mean shifts) and CUSUM on
+  z² (variance increases) over each spread's standardised Kalman innovations. Thresholds
+  are Monte Carlo-calibrated to a target false-alarm run length (`cusum_threshold`). An
+  alarm quarantines the spread immediately, blocks reactivation for `cooldown` bars, and
+  is logged in `res.breaks`, on the dashboard and in `plot_health`. Also:
+  `BreakMonitor`, `update_monitor!`, `page_cusum`, and the offline Brown-Durbin-Evans
+  `cusum_test`.
+- Planted breaks for validation: `simulate_ou_pair(...; break_at, break_kind)`,
+  `apply_break`, and `synthetic_universe(...; n_breaks, break_kind)`, with breaks of kind
+  `:beta`, `:level` or `:unit_root`. A broken universe is identical to its unbroken twin
+  up to each break.
+- Measured: alarms fire about 2× faster than the health gate (median 15 vs 40 bars when
+  cointegration dies). But real innovations raise false alarms about 4–5× above the
+  N(0,1) calibration, and on synthetic universes the existing gate already contains
+  breaks cheaply, so monitoring didn't improve Sharpe there. That's why it's off by
+  default, with `arl0 = 5000` (about one false alarm per 1000 spread-bars).
+
 ### Overfitting statistics
 
 - `overfitting_report(panel, configs)` runs a grid of configurations (sharing formations

@@ -340,7 +340,7 @@ function _varying_fields(cfgs::AbstractVector{BacktestConfig})
 end
 
 _short(x) = x
-function _short(x::Union{KalmanConfig,ExecConfig,RiskConfig})
+function _short(x::Union{KalmanConfig,ExecConfig,RiskConfig,BreakMonitorConfig})
     d = typeof(x)()
     ch = [string(f, "=", getfield(x, f)) for f in fieldnames(typeof(x)) if getfield(x, f) != getfield(d, f)]
     string(nameof(typeof(x)), "(", join(ch, ", "), ")")

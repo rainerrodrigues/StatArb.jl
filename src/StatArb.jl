@@ -27,6 +27,7 @@ include("screening.jl")
 include("health.jl")
 include("selection.jl")
 include("portfolio.jl")
+include("breaks.jl")
 include("strategy.jl")
 include("backtest.jl")
 include("rules.jl")
@@ -84,6 +85,8 @@ export RiskConfig, OverlayWorkspace, overlay_weights!, leg_shares,
        AbstractAllocator, DefaultAllocator, EqualWeightAllocator, target_weights!
 # metrics
 export performance, factor_attribution, panel_factors, health_telemetry, cost_breakdown, report, sparkline
+# structural breaks
+export BreakMonitorConfig, BreakMonitor, cusum_threshold, update_monitor!, reset_monitor!, page_cusum, cusum_test
 # overfitting statistics
 export normcdf, norminvcdf, probabilistic_sharpe, expected_max_sharpe, deflated_sharpe, pbo,
        stationary_bootstrap!, bootstrap_ci, parameter_grid, OverfittingReport, overfitting_report

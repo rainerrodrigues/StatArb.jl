@@ -685,7 +685,8 @@ end
     res = run_backtest(panel)
     dir = mktempdir()
     paths = export_results(dir, res)
-    @test sort(basename.(paths)) == sort(["equity.csv", "bars.csv", "health.csv", "fills.csv", "formations.csv", "summary.csv"])
+    @test sort(basename.(paths)) == sort(["equity.csv", "bars.csv", "health.csv", "fills.csv", "breaks.csv",
+                                          "formations.csv", "summary.csv"])
     eqlines = readlines(joinpath(dir, "equity.csv"))
     @test eqlines[1] == "t,timestamp,equity,ret" && length(eqlines) == length(res.t) + 1
     @test split(eqlines[2], ",")[4] == ""                             # first return is NaN → empty
@@ -894,6 +895,83 @@ end
     @test occursin("deflated Sharpe", s) && occursin("z_entry", s)
     @test_throws ArgumentError overfitting_report(panel, [BacktestConfig(), BacktestConfig(formation = 200, health_window = 200)])
     @test_throws ArgumentError overfitting_report(panel, [BacktestConfig()])
+end
+
+@testset "structural-break monitoring" begin
+    # thresholds hit the target in-control run length (independent seed)
+    h = cusum_threshold(400; k = 0.5, kind = :mean, nsim = 1500)
+    @test StatArb._arl(h, 0.5, :mean, 3000, 20_000, UInt64(4242)) ≈ 400 rtol = 0.08
+    hv = cusum_threshold(400; k = 0.5, kind = :variance, nsim = 1500)
+    @test StatArb._arl(hv, 0.5, :variance, 3000, 20_000, UInt64(4243)) ≈ 400 rtol = 0.08
+    @test cusum_threshold(400; k = 0.5, kind = :mean, nsim = 1500) === h          # cached
+    @test cusum_threshold(2000) > cusum_threshold(500)
+    @test_throws ArgumentError cusum_threshold(1.0)
+    @test_throws ArgumentError cusum_threshold(100; kind = :median)
+    # online monitor: quiet under N(0,1), fast on a shift, reset after an alarm, no allocation
+    rng = Xoshiro(121)
+    m = BreakMonitor(BreakMonitorConfig(enabled = true, arl0 = 1000, warmup = 0))
+    # false-alarm rate under N(0,1): ~0.27 alarms per 300 bars (combined ARL ≈ 1100)
+    fa = sum(count(_ -> update_monitor!(m, randn(rng)) !== :none, 1:300) for _ in 1:200) / 200
+    @test 0.1 < fa < 0.5
+    reset_monitor!(m)
+    t_up = findfirst(i -> update_monitor!(m, 1.5 + randn(rng)) === :mean_up, 1:500)
+    @test t_up !== nothing && t_up < 40
+    @test m.cpos == 0 && m.n == 0                                  # reset after the alarm
+    reset_monitor!(m)
+    @test findfirst(i -> update_monitor!(m, -1.5 + randn(rng)) === :mean_down, 1:500) < 40
+    reset_monitor!(m)
+    @test findfirst(i -> update_monitor!(m, 3randn(rng)) === :variance, 1:500) < 40
+    @test update_monitor!(m, NaN) === :none
+    mw = BreakMonitor(BreakMonitorConfig(warmup = 10))
+    @test all(update_monitor!(mw, 50.0) === :none for _ in 1:10)   # warm-up ignores everything
+    al(m) = @allocated update_monitor!(m, 0.1)
+    al(m)
+    @test al(m) == 0
+    # a high ARL makes a false alarm before the shift improbable (~1.5% over 300 bars)
+    alarms = page_cusum(vcat(randn(Xoshiro(7), 300), 2 .+ randn(Xoshiro(8), 100)); arl = 20_000)
+    @test any(x -> x.t > 300 && x.kind === :mean_up, alarms)
+    @test count(x -> x.t <= 300, alarms) <= 1
+    # Brown-Durbin-Evans CUSUM test
+    @test cusum_test(randn(rng, 400)).stable
+    bt = cusum_test(vcat(randn(rng, 200), 1 .+ randn(rng, 200)))
+    @test !bt.stable && bt.first_crossing > 200 && bt.statistic > 1
+    @test_throws ArgumentError cusum_test(randn(5))
+    # planted breaks: identical before the break, broken after
+    sim0 = simulate_ou_pair(Xoshiro(1), 600; half_life = 5.0)
+    for kind in (:beta, :level, :unit_root)
+        sim1 = simulate_ou_pair(Xoshiro(1), 600; half_life = 5.0, break_at = 400, break_kind = kind, break_size = 0.3)
+        @test sim1.y[1:399] == sim0.y[1:399] && sim1.x == sim0.x
+        @test sim1.y[401:end] != sim0.y[401:end]
+    end
+    # a unit-root break destroys cointegration: EG rejects before it, but only at its
+    # false-positive rate afterwards
+    ws = EGWorkspace(200, 2)
+    pre = post = 0
+    for s in 1:100
+        ur = simulate_ou_pair(Xoshiro(s), 900; half_life = 5.0, break_at = 400, break_kind = :unit_root)
+        pre += iscointegrated(engle_granger!(ws, ur.y[200:399], ur.x[200:399]))
+        post += iscointegrated(engle_granger!(ws, ur.y[700:899], ur.x[700:899]))
+    end
+    @test pre >= 70 && post <= 15
+    @test_throws ArgumentError simulate_ou_pair(Xoshiro(1), 100; break_at = 50, break_kind = :drift)
+    p0, _ = synthetic_universe(Xoshiro(122); T = 900)
+    p1, t1 = synthetic_universe(Xoshiro(122); T = 900, n_breaks = 3)
+    @test count(tr -> tr.break_t > 0, t1) == 3
+    tb = t1[1].break_t
+    @test p0.mid[1:2, 1:tb-1] == p1.mid[1:2, 1:tb-1] && p0.mid[7:end, :] == p1.mid[7:end, :]
+    @test_throws ArgumentError synthetic_universe(Xoshiro(1); n_pairs = 2, n_breaks = 3)
+    # in the backtest: off by default; on, alarms quarantine and are logged
+    panel, truth = synthetic_universe(Xoshiro(123); T = 1500, n_breaks = 4, break_kind = :unit_root)
+    @test isempty(run_backtest(panel).breaks)
+    r = run_backtest(panel, BacktestConfig(breaks = BreakMonitorConfig(enabled = true, arl0 = 1000)))
+    @test !isempty(r.breaks)
+    @test all(in((:mean_up, :mean_down, :variance)), r.breaks.kind)
+    b = r.breaks[1]
+    hc = filter(h -> h.pair == b.pair && b.t <= h.t < b.t + 60, r.health)
+    @test all(!h.healthy for h in hc)                              # cooldown blocks reactivation
+    @test occursin("Structural breaks", sprint(io -> report(io, r)))
+    @test haskey(result_tables(r), :breaks)
+    @test_throws ArgumentError validate_config(BacktestConfig(breaks = BreakMonitorConfig(arl0 = 5.0)))
 end
 
 @testset "synthetic ground truth recovery" begin

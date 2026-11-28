@@ -35,7 +35,7 @@ _baskets_string(bs) = join((join(b, "-") for b in bs), ";")
     result_tables(res) -> NamedTuple of column tables
 
 The backtest output as plain column tables: `equity` (bar, timestamp, equity, return),
-`bars`, `health`, `fills` and `formations` (selected pairs written as `y-x;…`, baskets as
+`bars`, `health`, `fills`, `breaks` (structural-break alarms) and `formations` (selected pairs written as `y-x;…`, baskets as
 `a-b-c;…`). Every table is a `NamedTuple` of vectors, so it can go straight to any
 Tables.jl sink.
 """
@@ -46,6 +46,7 @@ function result_tables(res::BacktestResult)
      bars = StructArrays.components(res.bars),
      health = StructArrays.components(res.health),
      fills = StructArrays.components(res.fills),
+     breaks = StructArrays.components(res.breaks),
      formations = (t = [x.t for x in f], n_candidates = [x.n_candidates for x in f],
                    n_cointegrated = [x.n_cointegrated for x in f], min_pvalue = [x.min_pvalue for x in f],
                    selected = [_pairs_string(x.selected) for x in f],
@@ -62,7 +63,7 @@ _write_arrow_table(path, tab) =
     export_results(dir, res; format=:csv) -> Vector{String}
 
 Write [`result_tables`](@ref) to `dir` (created if needed) as `equity`, `bars`, `health`,
-`fills` and `formations` files, plus `summary.csv` with the performance metrics.
+`fills`, `breaks` and `formations` files, plus `summary.csv` with the performance metrics.
 `format = :arrow` writes Arrow files instead (requires `using Arrow`). Returns the paths
 written.
 """
@@ -99,7 +100,8 @@ function plot_backtest end
 
 Health timeline of one spread: Johansen trace statistic against its critical value,
 estimated half-lives (Engle-Granger or Johansen, and the filter's), innovation
-autocorrelation, with quarantine periods shaded. Requires a Makie backend.
+autocorrelation, with quarantine periods shaded and structural-break alarms marked by
+dotted lines. Requires a Makie backend.
 """
 function plot_health end
 

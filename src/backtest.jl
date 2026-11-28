@@ -60,6 +60,7 @@ Base.@kwdef struct BacktestConfig
     kalman::KalmanConfig = KalmanConfig()
     exec::ExecConfig = ExecConfig()
     risk::RiskConfig = RiskConfig()
+    breaks::BreakMonitorConfig = BreakMonitorConfig()
     signal_rule::AbstractSignalRule = ZScoreBands()
     allocator::AbstractAllocator = DefaultAllocator()
 end
@@ -103,6 +104,8 @@ filter) or a basket (Johansen weights, [`BasketFilter`](@ref) signal).
 - `signal` / `last_signal`: desired direction this bar / last bar; `entry_t`, `blocked`
 - `state`: [`HealthState`](@ref); `hl`, `rank`: latest health-check estimates
 - `shares`: filled position per leg; `target`: this bar's target shares per leg
+- `monitor`: the spread's [`BreakMonitor`](@ref); `break_until`: after a break alarm the
+  spread stays quarantined until this bar
 """
 mutable struct SpreadState
     id::Int
@@ -125,6 +128,8 @@ mutable struct SpreadState
     created_t::Int
     shares::Vector{Float64}
     target::Vector{Float64}
+    monitor::BreakMonitor       # online structural-break detectors on the innovations
+    break_until::Int            # quarantined at least until this bar after a break alarm
 end
 
 """Number of legs of a spread."""
@@ -167,6 +172,25 @@ struct HealthRecord
     state::HealthState
 end
 
+"""
+    BreakRecord
+
+One structural-break alarm: bar `t`, spread id `pair`, its first two assets `y`/`x`, its
+size `k`, and the detector that fired (`kind`: `:mean_up`, `:mean_down` or `:variance`).
+"""
+struct BreakRecord
+    t::Int
+    pair::Int
+    y::Int
+    x::Int
+    k::Int
+    kind::Symbol
+end
+
+# disabled monitoring needs no threshold calibration: infinite thresholds never fire
+_new_monitor(cfg::BreakMonitorConfig) = cfg.enabled ? BreakMonitor(cfg) :
+    BreakMonitor(0.0, 0.0, 0.0, Inf, Inf, cfg.k, cfg.k_variance, false, cfg.max_abs_z, cfg.warmup, 0)
+
 struct BarRecord
     t::Int
     equity::Float64
@@ -203,7 +227,8 @@ Output of [`run_backtest`](@ref): bar indices `t`, `timestamps`, `equity` and `r
 columnar telemetry `bars`, `health` and `fills` (`StructVector`s, so they work with any
 Tables.jl consumer); `formations`; the final `book`; forced-liquidation bars
 `margin_calls`; `(bar, spread id)` of every filter rebuilt after diverging
-(`model_resets`); and the config used.
+(`model_resets`); every structural-break alarm (`breaks`, a `StructVector` of
+[`BreakRecord`](@ref)); and the config used.
 """
 struct BacktestResult
     config::BacktestConfig
@@ -218,6 +243,7 @@ struct BacktestResult
     book::Book
     margin_calls::Vector{Int}
     model_resets::Vector{Tuple{Int,Int}}
+    breaks::StructVector{BreakRecord}
     bars_per_year::Float64
     symbols::Vector{Symbol}
 end
@@ -320,6 +346,7 @@ mutable struct BacktestState
     formations::Vector{FormationRecord}
     margin_calls::Vector{Int}
     model_resets::Vector{Tuple{Int,Int}}
+    breaks::StructVector{BreakRecord}
     no_entry_until::Int
     liquidating::Bool
     open_sel::Vector{SpreadState}
@@ -338,7 +365,8 @@ function BacktestState(panel::PricePanel, cfg::BacktestConfig, cache::Union{Noth
                   ScreenWorkspace(n, cfg.formation), cache,
                   SpreadState[], Dict{Int,SpreadState}(), 1,
                   StructVector{HealthRecord}(undef, 0), StructVector{BarRecord}(undef, 0),
-                  FormationRecord[], Int[], Tuple{Int,Int}[], 0, false, SpreadState[], Float64[], UInt8[])
+                  FormationRecord[], Int[], Tuple{Int,Int}[], StructVector{BreakRecord}(undef, 0),
+                  0, false, SpreadState[], Float64[], UInt8[])
 end
 
 # ─── formation ───────────────────────────────────────────────────────────────
@@ -369,7 +397,7 @@ function _new_spread!(st::BacktestState, assets::Vector{Int}, weights::Vector{Fl
         push!(rr, r / wsum)
     end
     sp = SpreadState(st.next_id, assets, weights, model, ring, zr, rr, zeros(k == 2 ? 0 : W), ACTIVE, 0, true,
-                     0, 0, 0, false, hl, 1, t, zeros(k), zeros(k))
+                     0, 0, 0, false, hl, 1, t, zeros(k), zeros(k), _new_monitor(cfg.breaks), 0)
     st.next_id += 1
     push!(st.spreads, sp)
     st.byid[sp.id] = sp
@@ -578,9 +606,25 @@ function _update_spread!(st::BacktestState, sp::SpreadState, t::Int)
     _filter_step!(sp.model, logp, sp.assets, sp.weights, t)
     _model_finite(sp.model) || _reset_model!(st, sp, t)
     ispair(sp) && (sp.weights[2] = -hedge_ratio(sp.model))
-    push!(sp.zring, innovation_z(sp.model))
+    iz = innovation_z(sp.model)
+    push!(sp.zring, iz)
+    if cfg.breaks.enabled
+        alarm = update_monitor!(sp.monitor, iz)
+        alarm === :none || _on_break!(st, sp, t, alarm)
+    end
     push!(sp.rring, r / wsum)
     (t - sp.created_t) % cfg.health_every == 0 && _health_check!(st, sp, t)
+    nothing
+end
+
+# A structural-break alarm quarantines the spread right away (it closes this bar, because
+# only ACTIVE spreads may hold a signal) and blocks reactivation for the cooldown, however
+# its health checks look: their rolling window still contains pre-break data.
+function _on_break!(st::BacktestState, sp::SpreadState, t::Int, kind::Symbol)
+    sp.state = QUARANTINE
+    sp.good = 0
+    sp.break_until = t + st.cfg.breaks.cooldown
+    push!(st.breaks, BreakRecord(t, sp.id, sp.assets[1], sp.assets[2], nlegs(sp), kind))
     nothing
 end
 
@@ -606,6 +650,7 @@ function _reset_model!(st::BacktestState, sp::SpreadState, t::Int)
     sp.good = 0
     _model_finite(sp.model) || (sp.in_universe = false)
     push!(st.model_resets, (t, sp.id))
+    reset_monitor!(sp.monitor)
     nothing
 end
 
@@ -616,7 +661,7 @@ function _health_check!(st::BacktestState, sp::SpreadState, t::Int)
     lo, hi = cfg.hl_bounds
     if ispair(sp)
         eg = engle_granger!(st.egws, window(sp.ring, 1), window(sp.ring, 2); lags = cfg.adf_lags)
-        ok = healthy(st.gate, js, eg)
+        ok = healthy(st.gate, js, eg) && t >= sp.break_until
         hl, egadf, egβ = eg.half_life, eg.adf, eg.beta
         if cfg.kalman.recalibrate                 # re-fit the OU dynamics on the window
             xw = window(sp.ring, 2)
@@ -625,7 +670,7 @@ function _health_check!(st::BacktestState, sp::SpreadState, t::Int)
         kfβ = hedge_ratio(sp.model)
     else
         hl = js.half_life
-        ok = js.ok && js.rank >= 1 && lo <= hl <= hi
+        ok = js.ok && js.rank >= 1 && lo <= hl <= hi && t >= sp.break_until
         egadf = egβ = kfβ = NaN
         if cfg.kalman.recalibrate                 # re-fit on this spread's own window
             buf = sp.spbuf
@@ -857,5 +902,6 @@ function _run_backtest(panel::PricePanel, cfg::BacktestConfig, rule::R, alloc::A
     end
     rets = [eq[k] / eq[k-1] - 1 for k in 2:length(eq)]
     BacktestResult(cfg, collect(ts), panel.timestamps[ts], eq, rets, st.bars, st.health, st.sim.fills,
-                   st.formations, st.book, st.margin_calls, st.model_resets, panel.bars_per_year, panel.symbols)
+                   st.formations, st.book, st.margin_calls, st.model_resets, st.breaks, panel.bars_per_year,
+                   panel.symbols)
 end

@@ -28,6 +28,13 @@ function _check!(errs, e::ExecConfig)
     _need!(errs, e.vol_halflife > 0, "exec.vol_halflife must be positive, got $(e.vol_halflife)")
 end
 
+function _check!(errs, b::BreakMonitorConfig)
+    _need!(errs, b.arl0 >= 10, "breaks.arl0 must be ≥ 10 bars, got $(b.arl0)")
+    _need!(errs, b.k >= 0 && b.k_variance >= 0, "breaks reference values k must be ≥ 0")
+    _need!(errs, b.cooldown >= 0 && b.warmup >= 0, "breaks.cooldown and breaks.warmup must be ≥ 0")
+    _need!(errs, b.max_abs_z > 0, "breaks.max_abs_z must be positive")
+end
+
 function _check!(errs, r::RiskConfig)
     _need!(errs, r.pair_cap > 0, "risk.pair_cap must be positive, got $(r.pair_cap)")
     _need!(errs, r.max_gross > 0, "risk.max_gross must be positive, got $(r.max_gross)")
@@ -78,7 +85,7 @@ function _check!(errs, c::BacktestConfig)
     _need!(errs, c.risk.cov_window < c.formation, "risk.cov_window ($(c.risk.cov_window)) must be < formation ($(c.formation))")
     c.signal_rule isa CostAwareBands &&
         _need!(errs, c.signal_rule.cost_multiple >= 0, "CostAwareBands.cost_multiple must be ≥ 0")
-    _check!(errs, c.kalman); _check!(errs, c.exec); _check!(errs, c.risk)
+    _check!(errs, c.kalman); _check!(errs, c.exec); _check!(errs, c.risk); _check!(errs, c.breaks)
 end
 
 """
@@ -112,7 +119,7 @@ end
 # Configs compare by value. The default `==` for structs compares fields with `===` when
 # the struct is immutable but holds a mutable field (ExecConfig.borrow_rates is a Vector),
 # so two identical configs would otherwise be unequal.
-for T in (:KalmanConfig, :ExecConfig, :RiskConfig, :HealthGateConfig, :BacktestConfig)
+for T in (:KalmanConfig, :ExecConfig, :RiskConfig, :HealthGateConfig, :BreakMonitorConfig, :BacktestConfig)
     @eval Base.:(==)(a::$T, b::$T) = all(f -> getfield(a, f) == getfield(b, f), fieldnames($T))
     @eval Base.hash(a::$T, h::UInt) = foldl((h, f) -> hash(getfield(a, f), h), fieldnames($T); init = hash($(QuoteNode(T)), h))
 end
