@@ -780,6 +780,48 @@ end
     @test tel.trace_trajectory[2] == [median(h.trace_r0[h.t .== t]) for t in sort(unique(h.t))]
 end
 
+@testset "formation shortcuts are exact" begin
+    # Johansen skip gate: identical Benjamini-Hochberg decisions and an exact minimum p-value
+    for (seed, kw) in ((101, (;)), (102, (n_pairs = 0, n_noise = 30)))
+        panel, _ = synthetic_universe(Xoshiro(seed); T = 700, kw...)
+        logp, F, t, q = panel.logmid, 252, 600, 0.05
+        c = distance_screen(logp, t, F; top = 100, sector = panel.sector)
+        full = test_pairs(logp, c, t, F; threaded = false)
+        egn = eg_null_distribution(F)
+        gated = test_pairs(logp, c, t, F; threaded = false, eg_gate = (egn, q))
+        sk = [g.joh.rank == -1 for g in gated]
+        @test any(sk)
+        @test all(null_pvalue(egn, g.eg.adf) > q for g in gated[sk])
+        @test all(gated[i].joh == full[i].joh for i in findall(.!sk))
+        pf = pair_pvalues(full, F); pg = pair_pvalues(gated, F)
+        @test all(pg[sk] .<= pf[sk]) && all(pg[sk] .> q)        # lower bounds above q
+        @test benjamini_hochberg(pg, q) == benjamini_hochberg(pf, q)
+        st = StatArb.BacktestState(panel, BacktestConfig())
+        @test StatArb._select_formation(st, t).min_pvalue == minimum(pf)
+    end
+    # formation cache: shared, identical results, counted, tied to its panel
+    panel, _ = synthetic_universe(Xoshiro(103); T = 1000)
+    cache = FormationCache(panel)
+    base = BacktestConfig()
+    r0 = run_backtest(panel, base)
+    r1 = run_backtest(panel, base; formation_cache = cache)
+    @test cache.misses[] == length(r0.formations) && cache.hits[] == 0
+    alt = BacktestConfig(kalman = KalmanConfig(q_scale = 10.0), z_entry = 2.5)
+    r2 = run_backtest(panel, alt; formation_cache = cache)
+    @test cache.hits[] == length(r0.formations)                   # filter/signal changes reuse formations
+    @test r1.equity == r0.equity
+    @test r2.equity == run_backtest(panel, alt).equity
+    run_backtest(panel, BacktestConfig(max_pairs = 5); formation_cache = cache)
+    @test cache.misses[] == 2 * length(r0.formations)             # a selection setting changes the key
+    other, _ = synthetic_universe(Xoshiro(104); T = 1000)
+    @test_throws ArgumentError run_backtest(other, base; formation_cache = cache)
+    @test occursin("hits", sprint(show, cache))
+    sw1 = sensitivity_sweep(panel; q_scales = (1.0, 10.0), r_scales = (1.0,), windows = (120,), hl_scales = (0.5, 1.0))
+    sw0 = sensitivity_sweep(panel; q_scales = (1.0, 10.0), r_scales = (1.0,), windows = (120,), hl_scales = (0.5, 1.0),
+                            cache = false)
+    @test [(s.sharpe, s.n_fills) for s in sw1] == [(s.sharpe, s.n_fills) for s in sw0]
+end
+
 @testset "synthetic ground truth recovery" begin
     st = recovery_study(Xoshiro(8); nsim = 200, T = 500, beta = 1.2, half_life = 8.0)
     @test st.beta_eg.mean ≈ 1.2 atol = 0.02

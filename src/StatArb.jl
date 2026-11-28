@@ -77,7 +77,7 @@ export distance_screen, distance_screen!, ScreenWorkspace, normalized_window!, t
        eg_null_distribution_single, eg_pvalue, johansen_pvalue, basket_candidates
 # portfolio / backtest
 export RiskConfig, OverlayWorkspace, overlay_weights!, leg_shares,
-       BacktestConfig, BacktestResult, FormationRecord, HealthRecord, run_backtest, reconfigure, with,
+       BacktestConfig, BacktestResult, FormationRecord, HealthRecord, FormationSelection, FormationCache, run_backtest, reconfigure, with,
        validate_config, SpreadState, nlegs, ispair, zscore, isopen, SignalContext,
        AbstractSignalRule, ZScoreBands, CostAwareBands, update_signal!, round_trip_cost, cost_aware_entry,
        AbstractAllocator, DefaultAllocator, EqualWeightAllocator, target_weights!

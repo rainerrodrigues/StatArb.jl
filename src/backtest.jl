@@ -244,6 +244,60 @@ struct SignalContext
     overlay::OverlayWorkspace
 end
 
+# ─── formation selections and their cache ────────────────────────────────────
+
+"""
+    FormationSelection
+
+What one formation selected: the screened candidate count, the pairs that passed selection
+and the smallest selection p-value, the `selected` pairs as `(y, x)`, and the basket
+counterparts (`baskets` with their Johansen `basket_weights` and `basket_half_lives`).
+"""
+struct FormationSelection
+    n_candidates::Int
+    n_cointegrated::Int
+    min_pvalue::Float64
+    selected::Vector{NTuple{2,Int}}
+    n_basket_candidates::Int
+    n_basket_significant::Int
+    baskets::Vector{Vector{Int}}
+    basket_weights::Vector{Vector{Float64}}
+    basket_half_lives::Vector{Float64}
+end
+
+"""
+    FormationCache(panel)
+
+Shares formation *selections* between backtests on the same `panel`. A selection depends
+only on the data window and the selection-related settings (formation window, screen,
+lags, levels, FDR, half-life bounds, pair and basket limits), so runs that differ only in
+filter, signal, risk or execution settings, like most of a [`sensitivity_sweep`](@ref),
+reuse each other's formations instead of recomputing them. Results are identical with or
+without the cache. Thread-safe; `hits[]` and `misses[]` count lookups.
+
+    cache = FormationCache(panel)
+    run_backtest(panel, cfg1; formation_cache = cache)
+    run_backtest(panel, cfg2; formation_cache = cache)   # reuses cfg1's formations if compatible
+"""
+struct FormationCache
+    panel::PricePanel
+    store::Dict{Any,FormationSelection}
+    lock::ReentrantLock
+    hits::Threads.Atomic{Int}
+    misses::Threads.Atomic{Int}
+end
+FormationCache(panel::PricePanel) =
+    FormationCache(panel, Dict{Any,FormationSelection}(), ReentrantLock(), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0))
+
+Base.show(io::IO, c::FormationCache) =
+    print(io, "FormationCache(", length(c.store), " selections, ", c.hits[], " hits, ", c.misses[], " misses)")
+
+# every config field the selection step reads (threading doesn't change results)
+_selection_key(c::BacktestConfig) =
+    (c.formation, c.screen_top, c.same_sector_only, c.min_tradable_frac, c.adf_lags, c.johansen_lags,
+     c.coint_level, c.selection_fdr, c.null_sims, c.hl_bounds, c.max_pairs, c.unique_assets,
+     c.max_baskets, c.basket_size, c.basket_screen_top, c.min_basket_weight)
+
 # ─── state ───────────────────────────────────────────────────────────────────
 
 mutable struct BacktestState
@@ -257,6 +311,7 @@ mutable struct BacktestState
     gate::HealthGateConfig
     ows::OverlayWorkspace
     screen::ScreenWorkspace
+    cache::Union{Nothing,FormationCache}
     spreads::Vector{SpreadState}
     byid::Dict{Int,SpreadState}
     next_id::Int
@@ -272,7 +327,7 @@ mutable struct BacktestState
     act::Vector{UInt8}
 end
 
-function BacktestState(panel::PricePanel, cfg::BacktestConfig)
+function BacktestState(panel::PricePanel, cfg::BacktestConfig, cache::Union{Nothing,FormationCache} = nothing)
     n, W = nassets(panel), cfg.health_window
     jws = Dict{Int,JohansenWorkspace}(2 => JohansenWorkspace(2, W; kdiff = cfg.johansen_lags))
     cfg.max_baskets > 0 && (jws[cfg.basket_size] = JohansenWorkspace(cfg.basket_size, W; kdiff = cfg.johansen_lags))
@@ -280,7 +335,7 @@ function BacktestState(panel::PricePanel, cfg::BacktestConfig)
                   EGWorkspace(W, cfg.adf_lags), jws,
                   HealthGateConfig(cfg.hl_bounds, cfg.gate_on, cfg.recover_checks, cfg.coint_level),
                   OverlayWorkspace(2 * (cfg.max_pairs + cfg.max_baskets)),
-                  ScreenWorkspace(n, cfg.formation),
+                  ScreenWorkspace(n, cfg.formation), cache,
                   SpreadState[], Dict{Int,SpreadState}(), 1,
                   StructVector{HealthRecord}(undef, 0), StructVector{BarRecord}(undef, 0),
                   FormationRecord[], Int[], Tuple{Int,Int}[], 0, false, SpreadState[], Float64[], UInt8[])
@@ -348,7 +403,35 @@ _model_finite(m) = isfinite(m.z) && m.S > 0 && all(isfinite, m.θ) && all(isfini
     kalman_update!(m, v)
 end
 
-function _stage_formation!(st::BacktestState, t::Int)
+# Exact smallest selection p-value. Pairs whose Johansen test was skipped carry a lower
+# bound (p_EG); only those that could still undercut the current minimum get the test.
+function _exact_min_pvalue!(pv::Vector{Float64}, tests::Vector{PairTest}, logp, t::Int, cfg::BacktestConfig)
+    isempty(tests) && return NaN
+    F = cfg.formation
+    m = minimum((pv[i] for i in eachindex(tests) if !_skipped(tests[i].joh)); init = Inf)
+    sk = sort!([i for i in eachindex(tests) if _skipped(tests[i].joh) && pv[i] < m]; by = i -> pv[i])
+    isempty(sk) && return m
+    jw = JohansenWorkspace(2, F; kdiff = cfg.johansen_lags)
+    jn = johansen_null_distribution(F; kdiff = cfg.johansen_lags, nsim = cfg.null_sims)
+    X = zeros(2, F)
+    for i in sk
+        pv[i] >= m && break
+        pt = tests[i]
+        for s in 1:F
+            X[1, s] = logp[pt.y, t-F+s]
+            X[2, s] = logp[pt.x, t-F+s]
+        end
+        js = johansen!(jw, X; level = cfg.coint_level)
+        p = js.ok ? max(pv[i], null_pvalue(jn, js.trace_r0)) : 1.0
+        m = min(m, p)
+    end
+    m
+end
+
+# The selection half of a formation: screen, test, control the FDR and choose pairs and
+# baskets. A pure function of the panel, the selection-related config fields and `t`
+# (the workspace in `st.screen` is only scratch space), which is what makes it cacheable.
+function _select_formation(st::BacktestState, t::Int)
     cfg, panel = st.cfg, st.panel
     F = cfg.formation
     logp = panel.logmid
@@ -360,14 +443,21 @@ function _stage_formation!(st::BacktestState, t::Int)
                              same_sector = cfg.same_sector_only, eligible = eligible)
 
     # ── pairs: Engle-Granger + Johansen, FDR across candidates ──
-    tests = test_pairs(logp, cands, t, F; adf_lags = cfg.adf_lags, kdiff = cfg.johansen_lags,
-                       level = cfg.coint_level, threaded = cfg.threaded_formation)
     if cfg.selection_fdr > 0
+        # Johansen can't rescue a pair whose Engle-Granger p-value is already above q
+        egn = eg_null_distribution(F; lags = cfg.adf_lags, nsim = cfg.null_sims)
+        tests = test_pairs(logp, cands, t, F; adf_lags = cfg.adf_lags, kdiff = cfg.johansen_lags,
+                           level = cfg.coint_level, threaded = cfg.threaded_formation,
+                           eg_gate = (egn, cfg.selection_fdr))
         pv = pair_pvalues(tests, F; lags = cfg.adf_lags, kdiff = cfg.johansen_lags, nsim = cfg.null_sims)
         significant = benjamini_hochberg(pv, cfg.selection_fdr)
+        minp = _exact_min_pvalue!(pv, tests, logp, t, cfg)
     else
+        tests = test_pairs(logp, cands, t, F; adf_lags = cfg.adf_lags, kdiff = cfg.johansen_lags,
+                           level = cfg.coint_level, threaded = cfg.threaded_formation)
         pv = fill(NaN, length(tests))
         significant = [iscointegrated(pt.eg, cfg.coint_level) && pt.joh.ok && pt.joh.rank >= 1 for pt in tests]
+        minp = isempty(pv) ? NaN : minimum(pv)
     end
     keep = [significant[i] && lo <= tests[i].eg.half_life <= hi for i in eachindex(tests)]
     good = tests[keep]
@@ -423,8 +513,30 @@ function _stage_formation!(st::BacktestState, t::Int)
             push!(bhl, r.half_life)
         end
     end
-    push!(st.formations, FormationRecord(t, length(cands), length(good), isempty(pv) ? NaN : minimum(pv),
-                                         selected, nbc, nbs, bsel))
+    FormationSelection(length(cands), length(good), minp, selected, nbc, nbs, bsel, bweights, bhl)
+end
+
+function _cached_selection(cache::FormationCache, st::BacktestState, t::Int)
+    key = (t, _selection_key(st.cfg))
+    hit = lock(() -> get(cache.store, key, nothing), cache.lock)
+    if hit !== nothing
+        Threads.atomic_add!(cache.hits, 1)
+        return hit
+    end
+    Threads.atomic_add!(cache.misses, 1)
+    sel = _select_formation(st, t)           # computed outside the lock
+    lock(() -> get!(cache.store, key, sel), cache.lock)
+end
+
+function _stage_formation!(st::BacktestState, t::Int)
+    cfg, logp = st.cfg, st.panel.logmid
+    F = cfg.formation
+    cache = st.cache                 # a local, so the `nothing` check narrows its type
+    sel = cache === nothing ? _select_formation(st, t) : _cached_selection(cache, st, t)
+    selected, bsel = sel.selected, sel.baskets
+    # records get their own copies: a cached selection is shared between runs
+    push!(st.formations, FormationRecord(t, sel.n_candidates, sel.n_cointegrated, sel.min_pvalue, copy(selected),
+                                         sel.n_basket_candidates, sel.n_basket_significant, copy.(bsel)))
 
     # ── universe update: spreads are identified by their asset set ──
     selkeys = Set{Vector{Int}}(_key(p) for p in selected)
@@ -441,7 +553,7 @@ function _stage_formation!(st::BacktestState, t::Int)
         model = calibrate_filter(view(logp, yi, rng), view(logp, xi, rng), cfg.kalman; warmup = false)
         _new_spread!(st, [yi, xi], [1.0, -hedge_ratio(model)], model, t, NaN)
     end
-    for (b, w, hl) in zip(bsel, bweights, bhl)
+    for (b, w, hl) in zip(bsel, sel.basket_weights, sel.basket_half_lives)
         _key(b) in existing && continue
         v = [sum(w[l] * logp[b[l], τ] for l in eachindex(b)) for τ in rng]
         model = calibrate_basket_filter(v, cfg.kalman; warmup = false)
@@ -710,19 +822,25 @@ end
 # ─── main loop ───────────────────────────────────────────────────────────────
 
 """
-    run_backtest(panel, cfg=BacktestConfig()) -> BacktestResult
+    run_backtest(panel, cfg=BacktestConfig(); formation_cache=nothing) -> BacktestResult
 
 Walk-forward statistical-arbitrage backtest over pairs (and baskets if
 `cfg.max_baskets > 0`). Validates the configuration first ([`validate_config`](@ref)).
+Pass a [`FormationCache`](@ref) built for the same `panel` to share formation selections
+between runs (results are identical either way).
 """
-function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig())
+function run_backtest(panel::PricePanel, cfg::BacktestConfig = BacktestConfig();
+                      formation_cache::Union{Nothing,FormationCache} = nothing)
     validate_config(cfg, panel)
-    _run_backtest(panel, cfg, cfg.signal_rule, cfg.allocator)
+    formation_cache === nothing || formation_cache.panel === panel ||
+        throw(ArgumentError("formation_cache was built for a different panel"))
+    _run_backtest(panel, cfg, cfg.signal_rule, cfg.allocator, formation_cache)
 end
 
 # function barrier: specialise on the concrete rule and allocator types
-function _run_backtest(panel::PricePanel, cfg::BacktestConfig, rule::R, alloc::A) where {R<:AbstractSignalRule,A<:AbstractAllocator}
-    st = BacktestState(panel, cfg)
+function _run_backtest(panel::PricePanel, cfg::BacktestConfig, rule::R, alloc::A,
+                       cache::Union{Nothing,FormationCache} = nothing) where {R<:AbstractSignalRule,A<:AbstractAllocator}
+    st = BacktestState(panel, cfg, cache)
     F, T = cfg.formation, ntimes(panel)
     ts = F:T
     eq = zeros(length(ts))

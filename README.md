@@ -178,7 +178,8 @@ raw Sharpe of 10.9 drops to 2.9).
 | Johansen k=2, W=250 | ~10 µs | 0 |
 | Johansen k=3, W=250 | ~14 µs | 0 |
 | Full walk-forward, 30 assets × 2000 bars | ~27 ms | — |
-| Full walk-forward, 270 assets × 2500 bars, pairs + baskets | ~190 ms | 12.7 MiB total |
+| Full walk-forward, 270 assets × 2500 bars, pairs + baskets | ~155 ms | 12.7 MiB total |
+| Default 15-run sensitivity sweep on the same universe (shared formations) | ~1.4 s | — |
 | Distance screen, 1,500 assets (1.1M pairs) | ~18 ms | 8.7 MiB |
 
 ## What the demo shows (`examples/walkforward_demo.jl`)

@@ -113,6 +113,9 @@ struct JohansenSummary
     nobs::Int
 end
 const JOHANSEN_FAIL = JohansenSummary(false, 0, NaN, NaN, NaN, NaN, Inf, 0)
+# not run because it could not change a decision (see `test_pairs(...; eg_gate)`)
+const JOHANSEN_SKIPPED = JohansenSummary(false, -1, NaN, NaN, NaN, NaN, Inf, 0)
+_skipped(s::JohansenSummary) = s.rank == -1
 
 # Direct dsygvd call: A v = λ B v, ITYPE=1, JOBZ='V', UPLO='U'. Mirrors LAPACK.sygvd! but
 # uses workspace-owned WORK/IWORK so nothing is allocated.

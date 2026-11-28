@@ -21,8 +21,9 @@ off):
 | | Time | Allocated |
 |---|---|---|
 | Build the panel (all fields supplied) | 19 ms | 26 MiB (= the panel itself) |
-| Backtest, same-sector screen | 190 ms | 12.7 MiB |
+| Backtest, same-sector screen | 155 ms | 12.7 MiB |
 | Backtest, screen across all pairs | 236 ms | 12.6 MiB |
+| Default 15-run sensitivity sweep, single thread | 1.40 s | — |
 | Distance screen, 1,500 assets (1.1M pairs) | 18 ms | 8.7 MiB |
 
 ## Memory model
@@ -40,6 +41,27 @@ off):
   normalised window.
 - **Results.** Telemetry is stored as `StructVector`s of small immutable records, so each
   column is one contiguous vector.
+
+## Formation shortcuts
+
+- **Johansen skip gate.** A pair's selection p-value is `max(p_EG, p_Johansen)`, and
+  Benjamini-Hochberg at level `q` never accepts `p > q`. Formation therefore skips the
+  Johansen test whenever `p_EG > q`, which is about two thirds of screened candidates and
+  removes ~70% of each skipped pair's cost. Selections are provably unchanged, and the
+  logged minimum p-value is kept exact by testing skipped pairs lazily only when they
+  could hold it.
+- **[`FormationCache`](@ref).** A formation's selection depends only on the data window and
+  the selection settings, so backtests that differ in filter, signal, risk or execution
+  settings can share it. [`sensitivity_sweep`](@ref) does this by default, which makes the
+  default 15-run sweep 1.9× faster.
+
+```julia
+cache = FormationCache(panel)
+for q in (0.5, 1.0, 2.0)
+    run_backtest(panel, BacktestConfig(kalman = KalmanConfig(q_scale = q)); formation_cache = cache)
+end
+cache          # FormationCache(16 selections, 32 hits, 16 misses)
+```
 
 ## Where the time goes
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Faster formations and sweeps
+
+Both changes are verified bit for bit against v0.1.0 (equity, fills, every formation's
+selections and minimum p-value, telemetry, and a full sensitivity sweep, across seven
+configurations).
+
+- **Johansen skip gate**: formation no longer runs the Johansen test for a pair whose
+  Engle-Granger p-value already exceeds the FDR level `q`. Its selection p-value
+  `max(p_EG, p_Johansen)` can't pass Benjamini-Hochberg anyway. Johansen is ~70% of a
+  pair test's cost and about two thirds of screened candidates fail the gate. The logged
+  minimum p-value stays exact: skipped pairs are tested lazily only when they could hold
+  the minimum. New keyword `test_pairs(...; eg_gate = (null, q))`.
+- **`FormationCache`**: shares formation selections between backtests on the same panel,
+  keyed on every selection-related setting. `run_backtest(panel, cfg; formation_cache)`
+  uses it, and `sensitivity_sweep` uses it by default (`cache = true`), since its Q, R
+  and half-life runs never change formation inputs. The default 15-run sweep is 1.9×
+  faster, and a single 270-asset backtest is 15% faster from the gate alone.
+- New: `FormationSelection`, `FormationCache`.
+
 ## v0.1.0 (2026-11-25)
 
 First registered release. The sections below record how the package was built up

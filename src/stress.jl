@@ -16,12 +16,14 @@ One-at-a-time perturbation sweep around `base`:
   reversion speeds (< 1 ⇒ *over*-estimating reversion speed)
 
 Each run is an independent backtest, so runs are executed in parallel threads (formation
-threading is disabled inside to avoid nested oversubscription).
+threading is disabled inside to avoid nested oversubscription). With `cache = true` the
+runs share a [`FormationCache`](@ref): the Q, R and half-life runs don't change formation
+inputs and reuse the baseline's formations. Results are identical either way.
 """
 function sensitivity_sweep(panel::PricePanel, base::BacktestConfig = BacktestConfig();
                            q_scales = (0.1, 1.0, 10.0, 100.0), r_scales = (0.25, 1.0, 4.0),
                            windows = (60, 120, 250), hl_scales = (0.25, 0.5, 1.0, 2.0, 4.0),
-                           threaded::Bool = true)
+                           threaded::Bool = true, cache::Bool = true)
     base = reconfigure(base; threaded_formation = false)
     specs = Tuple{Symbol,Float64,BacktestConfig}[]
     for q in q_scales
@@ -39,11 +41,12 @@ function sensitivity_sweep(panel::PricePanel, base::BacktestConfig = BacktestCon
     for h in hl_scales
         push!(specs, (:hl_scale, h, reconfigure(base; hl_scale = h)))
     end
+    fc = cache ? FormationCache(panel) : nothing
     out = Vector{Any}(undef, length(specs))
     foreach_chunk(length(specs); threaded = threaded) do chunk
         for i in chunk
             nm, v, cfg = specs[i]
-            res = run_backtest(panel, cfg)
+            res = run_backtest(panel, cfg; formation_cache = fc)
             p = performance(res)
             out[i] = (param = nm, value = v, sharpe = p.sharpe, total_return = p.total_return,
                       max_drawdown = p.max_drawdown, n_fills = res.book.n_fills)

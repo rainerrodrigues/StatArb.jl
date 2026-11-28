@@ -198,11 +198,16 @@ end
     pair_pvalues(tests, T; lags=1, kdiff=1, nsim=10_000) -> Vector{Float64}
 
 Intersection-union p-value per tested pair: `max(p_EG, p_Johansen)`. A pair counts as
-significant only if *both* tests reject.
+significant only if *both* tests reject. For a pair whose Johansen test was skipped by
+`test_pairs(...; eg_gate)` the value is `p_EG`, a lower bound of the true p-value (and above
+the gate's `q`, so it can't change a Benjamini-Hochberg decision at that level).
 """
 function pair_pvalues(tests::AbstractVector{PairTest}, T::Integer; lags::Integer = 1,
                       kdiff::Integer = 1, nsim::Integer = 10_000)
     egn = eg_null_distribution(T; lags = lags, nsim = nsim)
     jn = johansen_null_distribution(T; kdiff = kdiff, nsim = nsim)
-    [pt.joh.ok ? max(null_pvalue(egn, pt.eg.adf), null_pvalue(jn, pt.joh.trace_r0)) : 1.0 for pt in tests]
+    map(tests) do pt
+        _skipped(pt.joh) && return null_pvalue(egn, pt.eg.adf)
+        pt.joh.ok ? max(null_pvalue(egn, pt.eg.adf), null_pvalue(jn, pt.joh.trace_r0)) : 1.0
+    end
 end

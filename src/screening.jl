@@ -291,14 +291,21 @@ struct PairTest
 end
 
 """
-    test_pairs(logp, pairs, t, W; adf_lags=1, kdiff=1, level=0.05, threaded=true) -> Vector{PairTest}
+    test_pairs(logp, pairs, t, W; adf_lags=1, kdiff=1, level=0.05, threaded=true, eg_gate=nothing) -> Vector{PairTest}
 
 Engle-Granger (both orientations; the more negative ADF wins) plus a k=2 Johansen test
 for each candidate over the window `t-W+1:t`. Threaded with one EG/Johansen workspace per
 task and single-threaded BLAS.
+
+`eg_gate = (null, q)` skips the Johansen test for pairs whose Engle-Granger p-value under
+`null` (a [`NullDistribution`](@ref)) exceeds `q`. Formation's selection p-value is
+`max(p_EG, p_Johansen)` and Benjamini-Hochberg at level `q` never accepts `p > q`, so such
+a pair can't be selected whatever Johansen says. Johansen is about 70% of a pair test's
+cost and typically two thirds of screened candidates fail this gate.
 """
 function test_pairs(logp::AbstractMatrix, pairs::AbstractVector{NTuple{2,Int}}, t::Integer, W::Integer;
-                    adf_lags::Int = 1, kdiff::Int = 1, level::Real = 0.05, threaded::Bool = true)
+                    adf_lags::Int = 1, kdiff::Int = 1, level::Real = 0.05, threaded::Bool = true,
+                    eg_gate = nothing)
     t - W + 1 >= 1 || throw(ArgumentError("not enough history"))
     out = Vector{PairTest}(undef, length(pairs))
     rng = t-W+1:t
@@ -312,6 +319,10 @@ function test_pairs(logp::AbstractMatrix, pairs::AbstractVector{NTuple{2,Int}}, 
             r1 = engle_granger!(eg, yi, xj; lags = adf_lags)
             r2 = engle_granger!(eg, xj, yi; lags = adf_lags)
             yy, xx, r = r1.adf <= r2.adf ? (i, j, r1) : (j, i, r2)
+            if eg_gate !== nothing && null_pvalue(eg_gate[1], r.adf) > eg_gate[2]
+                out[c] = PairTest(yy, xx, r, JOHANSEN_SKIPPED)
+                continue
+            end
             for s in 1:W
                 X[1, s] = logp[yy, rng[s]]
                 X[2, s] = logp[xx, rng[s]]
