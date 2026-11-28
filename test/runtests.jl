@@ -822,6 +822,80 @@ end
     @test [(s.sharpe, s.n_fills) for s in sw1] == [(s.sharpe, s.n_fills) for s in sw0]
 end
 
+@testset "overfitting statistics" begin
+    # normal distribution helpers against reference values
+    @test normcdf(1.96) ≈ 0.9750021048517795 rtol = 1e-14
+    @test normcdf(-8.0) ≈ 6.220960574271785e-16 rtol = 1e-12
+    @test normcdf(-3.5) ≈ 2.3262907903552504e-4 rtol = 1e-10        # just below the series/fraction switch
+    @test norminvcdf(0.975) ≈ 1.959963984540054 atol = 1e-14
+    @test norminvcdf(1e-10) ≈ -6.361340902404056 atol = 1e-12
+    @test all(abs(norminvcdf(normcdf(x)) - x) < 1e-10 for x in -6:0.25:4)
+    @test_throws DomainError norminvcdf(1.0)
+    # expected maximum Sharpe ratio of N skill-less trials
+    @test expected_max_sharpe(1, 1.0) == 0.0
+    @test expected_max_sharpe(10, 4.0) ≈ 2 * ((1 - 0.5772156649015329) * norminvcdf(0.9) +
+                                              0.5772156649015329 * norminvcdf(1 - 1 / (10ℯ)))
+    @test expected_max_sharpe(100, 1.0) > expected_max_sharpe(10, 1.0)
+    rng = Xoshiro(111)
+    good = 0.01 .* (randn(rng, 1000) .+ 0.2)
+    @test probabilistic_sharpe(good) > 0.999
+    @test probabilistic_sharpe(-good) < 0.001
+    @test probabilistic_sharpe(fill(0.001, 50)) == 1.0               # riskless positive excess return
+    @test probabilistic_sharpe(zeros(50)) == 0.5                     # no risk, no return: Sharpe 0
+    @test performance(fill(0.03 / 252, 300); rf = 0.03).sharpe == 0.0
+    # deflation removes the best-of-N false positives that PSR lets through
+    fp_psr = fp_dsr = 0
+    for _ in 1:200
+        R = 0.01 .* randn(rng, 600, 10)
+        srs = [mean(c) / std(c) for c in eachcol(R)]
+        d = deflated_sharpe(R[:, argmax(srs)], srs)
+        fp_psr += d.psr > 0.95; fp_dsr += d.dsr > 0.95
+        @test d.benchmark > 0 && d.n_trials == 10
+    end
+    @test fp_psr / 200 > 0.25
+    @test fp_dsr / 200 <= 0.05
+    # PBO: ~0.5 for skill-less strategies, low when skill is real and differs
+    pn = [pbo(0.01 .* randn(rng, 800, 12); n_blocks = 8).pbo for _ in 1:60]
+    @test 0.38 < mean(pn) < 0.62
+    # skill gaps well above the Sharpe estimation error, own seed: holds on every seed tried
+    sk = pbo(0.01 .* (randn(Xoshiro(5), 2000, 10) .+ range(0, 0.4; length = 10)'); n_blocks = 10)
+    @test sk.pbo < 0.1
+    @test sk.oos_is_ratio > 0.7
+    @test sk.prob_oos_loss < 0.05
+    @test sk.n_splits == binomial(10, 5) && length(sk.logits) == sk.n_splits
+    @test_throws ArgumentError pbo(randn(100, 5); n_blocks = 7)
+    @test_throws ArgumentError pbo(randn(100, 1))
+    @test_throws ArgumentError pbo(randn(10, 3); n_blocks = 16)
+    # stationary bootstrap
+    r = 0.01 .* randn(rng, 500)
+    out = zeros(500)
+    stationary_bootstrap!(out, r, Xoshiro(1); block = 10)
+    @test all(in(Set(r)), out)
+    ci = bootstrap_ci(x -> mean(x) / std(x), r; samples = 400, rng = Xoshiro(2))
+    @test ci.lo < ci.estimate < ci.hi && ci.se > 0
+    @test ci == bootstrap_ci(x -> mean(x) / std(x), r; samples = 400, rng = Xoshiro(2))   # reproducible
+    @test_throws ArgumentError bootstrap_ci(mean, r; level = 1.5)
+    # parameter grids and the report
+    g = parameter_grid(BacktestConfig(); z_entry = [1.5, 2.0], z_exit = [0.25, 0.5, 0.75])
+    @test length(g) == 6 && Set((c.z_entry, c.z_exit) for c in g) == Set(Iterators.product([1.5, 2.0], [0.25, 0.5, 0.75]))
+    @test parameter_grid(BacktestConfig()) == [BacktestConfig()]
+    # configs compare and hash by value, including those with vector fields
+    @test ExecConfig() == ExecConfig() && hash(ExecConfig()) == hash(ExecConfig())
+    @test BacktestConfig(z_entry = 2.5) == BacktestConfig(z_entry = 2.5) != BacktestConfig()
+    @test length(Set([BacktestConfig(), BacktestConfig(), BacktestConfig(z_exit = 0.3)])) == 2
+    panel, _ = synthetic_universe(Xoshiro(112); T = 1000)
+    rep = overfitting_report(panel, parameter_grid(BacktestConfig(); z_entry = [1.5, 2.5], z_exit = [0.25, 0.75]);
+                             samples = 300, n_blocks = 8)
+    @test rep.dsr > 0.95 && rep.pbo < 0.5
+    @test size(rep.returns) == (ntimes(panel) - 252, 4)
+    @test rep.sharpe[rep.best] == maximum(rep.sharpe)
+    @test rep.sharpe_ci[1] < rep.sharpe[rep.best] < rep.sharpe_ci[2]
+    s = sprint(show, MIME"text/plain"(), rep)
+    @test occursin("deflated Sharpe", s) && occursin("z_entry", s)
+    @test_throws ArgumentError overfitting_report(panel, [BacktestConfig(), BacktestConfig(formation = 200, health_window = 200)])
+    @test_throws ArgumentError overfitting_report(panel, [BacktestConfig()])
+end
+
 @testset "synthetic ground truth recovery" begin
     st = recovery_study(Xoshiro(8); nsim = 200, T = 500, beta = 1.2, half_life = 8.0)
     @test st.beta_eg.mean ≈ 1.2 atol = 0.02

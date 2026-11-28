@@ -21,8 +21,8 @@ report(res)                       # performance + execution costs + model health
 ## Where to start
 
 - [Getting started](@ref) walks through a full backtest on synthetic data.
-- [Validating the engine](@ref) checks parameter recovery and stress-tests the strategy
-  before you use real data.
+- [Validating the engine](@ref) checks parameter recovery, stress-tests the strategy, and
+  tests whether the best configuration of a grid is real or overfitted.
 - [Baskets and custom rules](@ref) covers trading 3–5 asset baskets, cost-aware entries,
   and writing your own signal rule or allocator.
 - [Plotting and exporting results](@ref) shows the Makie dashboard and CSV/Arrow export.

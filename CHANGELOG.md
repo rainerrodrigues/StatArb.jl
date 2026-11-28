@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Overfitting statistics
+
+- `overfitting_report(panel, configs)` runs a grid of configurations (sharing formations
+  through a `FormationCache`) and tests whether the best one is real: deflated Sharpe
+  ratio, probability of backtest overfitting by CSCV, OOS/IS Sharpe ratio of the in-sample
+  winner, probability of an out-of-sample loss, and a stationary-bootstrap confidence
+  interval for its Sharpe ratio. `parameter_grid(base; field = values, …)` builds grids.
+- Standalone: `probabilistic_sharpe`, `deflated_sharpe`, `expected_max_sharpe`, `pbo`
+  (all `C(S, S/2)` splits from per-block aggregates: 12,870 splits over 30 configurations
+  × 2,500 bars in about 18 ms), `stationary_bootstrap!`, `bootstrap_ci`, and a
+  dependency-free `normcdf` / `norminvcdf` (accurate to near machine precision).
+- Calibrated in the CI validation job. Among the best of 20 skill-less strategies, PSR
+  passes 0.95 62% of the time (theory: 64%) and DSR 0.1% of the time. PBO averages 0.49,
+  and bootstrap coverage is about 93% for a nominal 95%.
+- Fix: `performance` (and the new statistics) no longer report a meaningless Sharpe ratio
+  for a series that takes no risk, such as a strategy that never trades and whose excess
+  return is floating-point dust. It's now 0, or ±Inf for a genuinely riskless non-zero
+  excess return.
+- Fix: configuration types compare and hash by value. `ExecConfig() == ExecConfig()` used
+  to be `false`, because the default comparison checks the `borrow_rates` vector by
+  identity.
+
 ### Faster formations and sweeps
 
 Both changes are verified bit for bit against v0.1.0 (equity, fills, every formation's

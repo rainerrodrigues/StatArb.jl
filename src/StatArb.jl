@@ -34,6 +34,7 @@ include("validate.jl")
 include("metrics.jl")
 include("synthetic.jl")
 include("stress.jl")
+include("overfitting.jl")
 include("export.jl")
 
 """
@@ -83,6 +84,9 @@ export RiskConfig, OverlayWorkspace, overlay_weights!, leg_shares,
        AbstractAllocator, DefaultAllocator, EqualWeightAllocator, target_weights!
 # metrics
 export performance, factor_attribution, panel_factors, health_telemetry, cost_breakdown, report, sparkline
+# overfitting statistics
+export normcdf, norminvcdf, probabilistic_sharpe, expected_max_sharpe, deflated_sharpe, pbo,
+       stationary_bootstrap!, bootstrap_ci, parameter_grid, OverfittingReport, overfitting_report
 # synthetic / stress
 export simulate_ou_pair, simulate_vecm, synthetic_universe, recovery_study,
        sensitivity_sweep, misspecification_asymmetry, print_sweep

@@ -91,6 +91,13 @@ Modules = [StatArb]
 Pages = ["metrics.jl"]
 ```
 
+## Overfitting statistics
+
+```@autodocs
+Modules = [StatArb]
+Pages = ["overfitting.jl"]
+```
+
 ## Synthetic data
 
 ```@autodocs

@@ -2,6 +2,12 @@
 # Performance metrics, factor attribution, model-health telemetry, text dashboard.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Below this per-period standard deviation a return series carries no risk: a strategy that
+# never trades has excess returns of pure floating-point dust, whose mean/σ is meaningless.
+# Such a series has Sharpe 0, unless its mean is clearly non-zero (riskless excess return: ±Inf).
+const _MIN_RETURN_SD = 1e-10
+_riskless_sharpe(μ) = abs(μ) <= _MIN_RETURN_SD ? 0.0 : copysign(Inf, μ)
+
 """
     performance(returns; bars_per_year=252, rf=0.0) -> NamedTuple
 
@@ -24,8 +30,8 @@ function performance(r::AbstractVector{<:Real}; bars_per_year::Real = 252.0, rf:
     cagr = eq[end] > 0 ? eq[end]^(1 / years) - 1 : -1.0
     nz = count(!iszero, r)
     (total_return = tot, cagr = cagr, vol = σ * sqrt(bars_per_year),
-     sharpe = σ > 0 ? μ / σ * sqrt(bars_per_year) : NaN,
-     sortino = dd > 0 ? μ / dd * sqrt(bars_per_year) : NaN,
+     sharpe = σ > _MIN_RETURN_SD ? μ / σ * sqrt(bars_per_year) : _riskless_sharpe(μ),
+     sortino = dd > _MIN_RETURN_SD ? μ / dd * sqrt(bars_per_year) : _riskless_sharpe(μ),
      max_drawdown = mdd, calmar = mdd > 0 ? cagr / mdd : NaN,
      hit_rate = nz > 0 ? count(>(0), r) / nz : NaN, n = n)
 end

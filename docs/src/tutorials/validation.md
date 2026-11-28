@@ -67,3 +67,52 @@ underestimating it by the same factor:
 ```@example val
 misspecification_asymmetry(sw)
 ```
+
+## Is the best configuration real?
+
+A sensitivity sweep or a parameter grid always produces a "best" configuration, and some
+of its edge is luck: try enough settings and one of them will look good.
+[`overfitting_report`](@ref) runs a grid (sharing formations through a
+[`FormationCache`](@ref)) and asks three questions about the winner:
+
+- **[`deflated_sharpe`](@ref):** does it beat the Sharpe ratio the best of that many
+  *skill-less* configurations would reach by luck ([`expected_max_sharpe`](@ref))? This
+  accounts for sample length, skewness and fat tails. Look for a value above 0.95.
+- **[`pbo`](@ref):** in combinatorially symmetric cross-validation, how often does the
+  in-sample winner rank in the bottom half out of sample? Look for a value below 0.5,
+  ideally below 0.2. The out-of-sample over in-sample Sharpe ratio of the winner should be
+  close to 1.
+- **[`bootstrap_ci`](@ref):** a stationary-bootstrap confidence interval for the winner's
+  Sharpe ratio, which preserves the serial dependence of mean-reversion P&L.
+
+On a universe with real (planted) pairs:
+
+```@example val
+panel, _ = synthetic_universe(Xoshiro(3); T = 1500)
+grid = parameter_grid(BacktestConfig(); z_entry = [1.5, 2.0, 2.5], z_exit = [0.25, 0.75],
+                      kalman = [KalmanConfig(q_scale = q) for q in (1.0, 10.0)])
+overfitting_report(panel, grid; samples = 1000)
+```
+
+And on pure noise, with false-discovery control switched off so that spurious pairs
+actually get traded:
+
+```@example val
+noise, _ = synthetic_universe(Xoshiro(3); n_pairs = 0, n_noise = 30, T = 1500)
+noise_grid = parameter_grid(BacktestConfig(selection_fdr = 0.0); z_entry = [1.5, 2.0, 2.5],
+                            z_exit = [0.25, 0.75], kalman = [KalmanConfig(q_scale = q) for q in (1.0, 10.0)])
+overfitting_report(noise, noise_grid; samples = 1000)
+```
+
+The noise winner's probabilistic Sharpe ratio still looks encouraging, but it fails the
+deflated Sharpe test, and almost none of its in-sample performance carries over out of
+sample. Judge the metrics together. PBO alone can look acceptable when the configurations
+in a grid are highly correlated, because the in-sample winner then tends to be close to
+the median anyway.
+
+!!! note "Calibration"
+    The CI validation job checks the statistics on skill-less strategies. Among the best
+    of 20, PSR exceeds 0.95 about 62% of the time (theory: 64%), while the deflated Sharpe
+    ratio exceeds it about 0.1% of the time. PBO averages 0.49, and the bootstrap interval
+    covers the true Sharpe about 93% of the time. The DSR is deliberately conservative:
+    the maximum of `N` Sharpe ratios varies much less than a single one does.

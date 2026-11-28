@@ -108,3 +108,11 @@ function validate_config(cfg::BacktestConfig, p::PricePanel)
     isempty(errs) || throw(ArgumentError("invalid BacktestConfig for this panel:\n  • " * join(errs, "\n  • ")))
     nothing
 end
+
+# Configs compare by value. The default `==` for structs compares fields with `===` when
+# the struct is immutable but holds a mutable field (ExecConfig.borrow_rates is a Vector),
+# so two identical configs would otherwise be unequal.
+for T in (:KalmanConfig, :ExecConfig, :RiskConfig, :HealthGateConfig, :BacktestConfig)
+    @eval Base.:(==)(a::$T, b::$T) = all(f -> getfield(a, f) == getfield(b, f), fieldnames($T))
+    @eval Base.hash(a::$T, h::UInt) = foldl((h, f) -> hash(getfield(a, f), h), fieldnames($T); init = hash($(QuoteNode(T)), h))
+end

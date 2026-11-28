@@ -32,7 +32,7 @@ each layer, and the full API.
 | Workflow | What it checks |
 |---|---|
 | `ci.yml` → `test` | the full test suite (Aqua included) on Julia 1.10, 1.11 and latest on Linux, plus latest on macOS and Windows; coverage goes to Codecov |
-| `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery, false selections on pure noise, p-value calibration, Kalman innovation whiteness and spread tracking, and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
+| `ci.yml` → `validation` | Monte Carlo checks of test size and power, parameter-recovery bias, VECM rank recovery, false selections on pure noise, p-value calibration, Kalman innovation whiteness and spread tracking, overfitting-statistic calibration, and multi-seed lookahead perturbation (`benchmark/validation.jl`); fails the build if any check leaves its tolerance |
 | `ci.yml` → `benchmark` | hot-loop latency, allocation counts and backtest throughput, posted to the job summary |
 | `ci.yml` → `plotting` | renders every plot of the Makie extension with CairoMakie |
 | `ci.yml` → `jet` | JET static analysis of the whole package (pinned to Julia 1.12) |
@@ -154,6 +154,16 @@ specialises on the concrete types. `CostAwareBands` only enters when the expecte
 reversion pays for the estimated round trip. It never binds when costs are small; with
 30 bps spreads on low-volatility spreads, it turned a −1.6% excess return into +0.1%
 while trading 93% less.
+
+**Overfitting statistics.** `overfitting_report(panel, parameter_grid(cfg; …))` runs a grid
+and tests whether its best configuration is real:
+- the deflated Sharpe ratio, against the best Sharpe that many skill-less configurations would
+  reach by luck;
+- the probability of backtest overfitting, by combinatorially symmetric cross-validation;
+- a stationary-bootstrap confidence interval for the winner's Sharpe.
+
+On skill-less strategies, the best of 20 passes a plain probabilistic-Sharpe test 62% of the time
+but the deflated test only 0.1% of the time.
 
 **Exact p-values.** `adf_pvalue`, `eg_pvalue` and `johansen_pvalue` give finite-sample
 Monte Carlo p-values for the statistics as computed, cached per configuration.

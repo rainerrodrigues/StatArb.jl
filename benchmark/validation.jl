@@ -107,6 +107,27 @@ function adf_calibration(seed, n)
     mean(adf_pvalue(adf!(ws, cumsum(randn(rng, 250)), 1)) < 0.05 for _ in 1:n)
 end
 
+# Overfitting statistics under the null: best-of-N false positives, PBO calibration,
+# bootstrap coverage
+function overfitting_calibration(seed)
+    rng = Xoshiro(seed)
+    fp_psr = fp_dsr = 0
+    for _ in 1:1000
+        R = 0.01 .* randn(rng, 750, 20)
+        srs = [mean(c) / std(c) for c in eachcol(R)]
+        d = deflated_sharpe(R[:, argmax(srs)], srs)
+        fp_psr += d.psr > 0.95; fp_dsr += d.dsr > 0.95
+    end
+    pn = mean(pbo(0.01 .* randn(rng, 1000, 15); n_blocks = 10).pbo for _ in 1:300)
+    cover = 0
+    for _ in 1:400
+        r = 0.01 .* (randn(rng, 750) .+ 0.05)
+        ci = bootstrap_ci(x -> mean(x) / std(x), r; samples = 400, block = 5, rng = rng)
+        cover += ci.lo <= 0.05 <= ci.hi
+    end
+    fp_psr / 1000, fp_dsr / 1000, pn, cover / 400
+end
+
 t0 = time()
 eg, j2, j3 = size_study(11, 4000, 250)
 check("Engle-Granger size (5% test, T=250)", fmt(eg), "0.035 – 0.065", 0.035 <= eg <= 0.065)
@@ -139,6 +160,12 @@ bp, bn = basket_precision(51:56)
 check("baskets: share of selections that are planted baskets ($bn selections)", fmt(bp), "≥ 0.85", bp >= 0.85)
 ac = adf_calibration(16, 2000)
 check("ADF Monte Carlo p-values on random walks: P(p < 0.05)", fmt(ac), "0.035 – 0.065", 0.035 <= ac <= 0.065)
+
+fpp, fpd, pn, cov = overfitting_calibration(17)
+check("best of 20 skill-less strategies: P(PSR > 0.95)", fmt(fpp), "(reference: 1 − 0.95²⁰ ≈ 0.64)", true)
+check("best of 20 skill-less strategies: P(deflated Sharpe > 0.95)", fmt(fpd), "≤ 0.05", fpd <= 0.05)
+check("PBO of skill-less strategies (mean of 300)", fmt(pn), "0.45 – 0.55", 0.45 <= pn <= 0.55)
+check("stationary-bootstrap 95% CI coverage of the true Sharpe", fmt(cov), "0.91 – 0.97 (percentile CIs run slightly narrow)", 0.91 <= cov <= 0.97)
 
 rr = vecm_rank_recovery(13, 300)
 check("VECM rank recovery (true r=2)", fmt(rr), "≥ 0.90", rr >= 0.90)
