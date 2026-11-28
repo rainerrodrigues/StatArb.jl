@@ -15,11 +15,13 @@
   `apply_break`, and `synthetic_universe(...; n_breaks, break_kind)`, with breaks of kind
   `:beta`, `:level` or `:unit_root`. A broken universe is identical to its unbroken twin
   up to each break.
-- Measured: alarms fire about 2× faster than the health gate (median 15 vs 40 bars when
-  cointegration dies). But real innovations raise false alarms about 4–5× above the
+- Measured: alarms catch breaks earlier than the health gate (median 15–16 vs 20–40 bars
+  across two measurements on universes where cointegration dies). But real innovations raise false alarms about 4–5× above the
   N(0,1) calibration, and on synthetic universes the existing gate already contains
   breaks cheaply, so monitoring didn't improve Sharpe there. That's why it's off by
   default, with `arl0 = 5000` (about one false alarm per 1000 spread-bars).
+- The CI validation job checks the threshold calibration, the false-alarm rate on stable
+  universes, and that alarms beat the health gate on planted unit-root breaks.
 
 ### Overfitting statistics
 

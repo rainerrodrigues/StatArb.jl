@@ -128,6 +128,37 @@ function overfitting_calibration(seed)
     fp_psr / 1000, fp_dsr / 1000, pn, cover / 400
 end
 
+# Structural-break monitoring: threshold calibration, false alarms on stable universes,
+# and detection speed versus the health gate on planted unit-root breaks
+function break_monitoring(seeds)
+    h = cusum_threshold(2000; k = 0.5, kind = :mean)
+    arl = StatArb._arl(h, 0.5, :mean, 4000, 100_000, UInt64(20261128))
+    on = BacktestConfig(breaks = BreakMonitorConfig(enabled = true), threaded_formation = false)
+    fa = 0; sb = 0; dalarm = Int[]; dgate = Int[]
+    for s in seeds
+        stable, _ = synthetic_universe(Xoshiro(s); n_pairs = 10, n_noise = 10, T = 1500)
+        r = run_backtest(stable, on)
+        fa += length(r.breaks); sb += sum(r.bars.n_pairs)
+        broken, truth = synthetic_universe(Xoshiro(s); n_pairs = 10, n_noise = 10, T = 1500,
+                                           n_breaks = 5, break_kind = :unit_root)
+        rb = run_backtest(broken, on)
+        for tr in truth
+            tr.break_t == 0 && continue
+            key = Set(tr.assets)
+            ia = findfirst(x -> x.t >= tr.break_t && Set((x.y, x.x)) == key, rb.breaks)
+            ia === nothing || push!(dalarm, rb.breaks[ia].t - tr.break_t)
+        end
+        r0 = run_backtest(broken, BacktestConfig(threaded_formation = false))
+        for tr in truth
+            tr.break_t == 0 && continue
+            key = Set(tr.assets)
+            ig = findfirst(x -> x.t >= tr.break_t && Set((x.y, x.x)) == key && !x.healthy, r0.health)
+            ig === nothing || push!(dgate, r0.health[ig].t - tr.break_t)
+        end
+    end
+    arl, 1000fa / sb, median(dalarm), median(dgate), length(dalarm)
+end
+
 t0 = time()
 eg, j2, j3 = size_study(11, 4000, 250)
 check("Engle-Granger size (5% test, T=250)", fmt(eg), "0.035 – 0.065", 0.035 <= eg <= 0.065)
@@ -166,6 +197,13 @@ check("best of 20 skill-less strategies: P(PSR > 0.95)", fmt(fpp), "(reference: 
 check("best of 20 skill-less strategies: P(deflated Sharpe > 0.95)", fmt(fpd), "≤ 0.05", fpd <= 0.05)
 check("PBO of skill-less strategies (mean of 300)", fmt(pn), "0.45 – 0.55", 0.45 <= pn <= 0.55)
 check("stationary-bootstrap 95% CI coverage of the true Sharpe", fmt(cov), "0.91 – 0.97 (percentile CIs run slightly narrow)", 0.91 <= cov <= 0.97)
+
+barl, bfa, bda, bdg, bn = break_monitoring(61:66)
+check("break monitor: independent MC run length (target 2000, mean CUSUM)", @sprintf("%.0f", barl), "1840 – 2160",
+      1840 <= barl <= 2160)
+check("break monitor: false alarms per 1000 spread-bars, stable universes", fmt(bfa), "≤ 1.5", bfa <= 1.5)
+check("break monitor: median delay on unit-root breaks, alarm vs health gate ($bn detected)",
+      @sprintf("%.0f vs %.0f bars", bda, bdg), "alarm faster", bda < bdg)
 
 rr = vecm_rank_recovery(13, 300)
 check("VECM rank recovery (true r=2)", fmt(rr), "≥ 0.90", rr >= 0.90)

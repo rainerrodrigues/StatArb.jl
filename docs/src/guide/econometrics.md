@@ -91,6 +91,66 @@ two tests passes. See [`HealthGateConfig`](@ref).
     so healthy pairs keep getting quarantined. The default `health_window = 250`, and the
     sensitivity sweep shows what shorter windows cost.
 
+## Structural-break monitoring
+
+The health gate re-tests each spread every `health_every` bars on a rolling window that
+still contains pre-break data, so it notices a broken relationship only after the window
+has turned over enough. Break monitoring watches every bar instead. It's off by default;
+turn it on with `BacktestConfig(breaks = BreakMonitorConfig(enabled = true))`.
+
+**What it monitors.** Each spread's standardised Kalman innovations
+``z_t = e_t / \sqrt{S_t}``. While the model holds they are white ``\mathcal N(0, 1)``,
+which the OU-augmented filter makes them (see [Kalman hedge ratios](@ref)). That makes
+them the statistically valid input for sequential change detection. Raw spreads or
+regression residuals are autocorrelated and would put the false-alarm rate far off its
+calibration.
+
+**Two detectors** run online, in O(1) per bar and with no allocation
+([`update_monitor!`](@ref)):
+
+```math
+C^+_t = \max(0,\ C^+_{t-1} + z_t - k), \qquad C^-_t = \max(0,\ C^-_{t-1} - z_t - k), \qquad
+V_t = \max\!\left(0,\ V_{t-1} + \tfrac{z_t^2 - 1}{\sqrt 2} - k_v\right)
+```
+
+- `C⁺` or `C⁻` above `h` means a **mean shift**: the hedge ratio or the equilibrium level
+  has moved.
+- `V` above `h_v` means a **variance increase**: the spread has stopped mean-reverting.
+
+**Calibration.** [`cusum_threshold`](@ref) sets `h` and `h_v` by Monte Carlo so that, for
+N(0, 1) input, the two detectors together average `arl0` bars between false alarms (each
+gets half the budget). Independent simulations match the target to within about 2%.
+Median detection delay is 12 bars for a 1σ mean shift, 43 bars for a 0.5σ shift, and 7
+bars when the variance quadruples.
+
+**What an alarm does.** The spread moves to [`QUARANTINE`](@ref) at once, so it closes on
+the same bar. It stays quarantined for `cooldown` bars whatever its health checks say,
+then needs `recover_checks` passing checks as usual. Every alarm is a
+[`BreakRecord`](@ref) in `res.breaks`. Alarms are also counted on the dashboard and marked
+on [`plot_health`](@ref).
+
+!!! note "Why it's off by default"
+    Measured on synthetic universes in which planted pairs break (unit root, hedge-ratio
+    jump, level shift), alarms catch breaks earlier than the health gate. The median
+    delay was 15–16 bars against 20–40 bars across two measurements. Two things work
+    against it, though:
+    - **False alarms.** Real filter innovations have fatter tails than N(0, 1) and small
+      persistent biases (the intercept adapts with a lag), so false alarms come 4–5× more
+      often than the calibration assumes. The default `arl0 = 5000` gives about one per
+      1000 spread-bars, and each one benches a healthy pair for the cooldown.
+    - **Cheap breaks.** On these universes the health gate, time stops and re-selection
+      already contain breaks cheaply, so monitoring didn't improve the Sharpe ratio in any
+      scenario tested.
+
+    Turn it on when a break is expensive for you: large or illiquid positions, slow
+    health checks (large `health_every`), or long holding periods.
+
+[`synthetic_universe`](@ref)`(...; n_breaks, break_kind)` plants breaks of kind `:beta`,
+`:level` or `:unit_root` ([`apply_break`](@ref)). A broken universe is identical to its
+unbroken twin up to each break date, which makes clean comparisons possible. Offline,
+[`page_cusum`](@ref) replays the detectors over any innovation series, and
+[`cusum_test`](@ref) runs the Brown-Durbin-Evans CUSUM stability test.
+
 ## Selecting pairs with false-discovery control
 
 Formation tests up to `screen_top` candidates at once. If each one is tested at 5%, about
